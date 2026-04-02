@@ -1,0 +1,10 @@
+CellRegulonDB export guide
+
+1. Open https://www.cellregulondb.org/network.html
+2. Paste the genes from CellRegulonDB_query_genes.txt into the gene filter.
+3. Add tissue or cell-type filters if you know the most relevant biological context.
+4. Run the query and download the resulting CSV.
+5. Save that file into the data/ folder as CellRegulonDB_edges.csv or CellRegulonDB_regulons.csv.
+
+The app expects a source TF/regulator column and a target-gene column.
+Optional tissue, cell-type, and regulon columns will be shown in the SEMgraph validation context.

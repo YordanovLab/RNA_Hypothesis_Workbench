@@ -1,0 +1,8 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Start RNA Hypothesis Workbench (Linux)
+Comment=Launch the RNA Hypothesis Workbench
+Exec=sh -lc 'cd "$(dirname "%k")" && bash ./launchers/start_workbench.sh'
+Terminal=true
+Categories=Science;Education;

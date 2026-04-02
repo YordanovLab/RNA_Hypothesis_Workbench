@@ -1,0 +1,77 @@
+RNA Hypothesis Workbench
+Start here
+
+If you are not sure what to click, use only these files:
+- START_HERE.txt
+- START_WORKBENCH_Windows.bat
+- START_WORKBENCH_Linux.desktop
+
+Windows
+1. Double-click:
+   START_WORKBENCH_Windows.bat
+2. It will try, in order:
+   - Windows R
+   - WSL R
+   - then this setup guide if neither is available
+3. If the app is already running, the launcher will open the existing browser session instead of starting a second copy.
+4. If the browser does not open automatically, go to:
+   http://127.0.0.1:3838
+
+Linux desktop
+1. Double-click:
+   START_WORKBENCH_Linux.desktop
+2. If the app is already running, the launcher will open the existing browser session instead of starting a second copy.
+3. If the browser does not open automatically, go to:
+   http://127.0.0.1:3838
+
+WSL or Linux terminal
+1. Open a terminal in this folder
+2. Run:
+   bash launchers/start_workbench.sh
+3. If the app is already running, the launcher will open the existing browser session instead of starting a second copy.
+4. If the browser does not open automatically, go to:
+   http://127.0.0.1:3838
+
+What must be installed first
+1. R
+2. The required R packages
+
+Install R
+- Windows:
+  https://cran.r-project.org/
+- Linux:
+  install R through your package manager or from CRAN
+- WSL:
+  install R inside the WSL Linux environment too
+
+Install the required R packages
+Open R or RStudio and run:
+
+install.packages(c(
+  "shiny",
+  "plotly",
+  "DT",
+  "jsonlite",
+  "BiocManager"
+))
+
+BiocManager::install(c(
+  "DESeq2",
+  "clusterProfiler",
+  "AnnotationDbi",
+  "org.Hs.eg.db",
+  "GO.db"
+))
+
+install.packages("WGCNA")
+install.packages("SEMgraph")
+
+If something does not start
+- If Windows says Rscript is missing, install R for Windows.
+- If Windows falls back to WSL but that also fails, install R inside WSL.
+- If Linux or WSL says Rscript is missing, install R in that environment.
+
+What the launcher does
+- It starts:
+  Rscript deseq2_workbench.R
+- Then the Shiny app opens in the browser.
