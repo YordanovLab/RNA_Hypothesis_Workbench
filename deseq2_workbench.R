@@ -122,7 +122,7 @@ read_inputs <- function(counts_path, meta_path, min_count, min_samples) {
   log_cpm <- log2(sweep(filtered, 2L, lib / 1e6, "/") + 1)
   pca <- prcomp(t(log_cpm), center = TRUE, scale. = TRUE)
   gene_map <- map_gene_symbols(rownames(counts))
-  list(counts = counts, filtered = filtered, meta = meta, log_cpm = log_cpm, pca = pca, dist = as.matrix(dist(t(log_cpm))), gene_map = gene_map)
+  list(counts = counts, filtered = filtered, meta = meta, log_cpm = log_cpm, pca = pca, dist = as.matrix(dist(t(log_cpm))), gene_map = gene_map, counts_path = counts_path, metadata_path = meta_path, min_count = min_count, min_samples = min_samples)
 }
 
 resolve_input_path <- function(upload_info, typed_path) {
@@ -318,6 +318,27 @@ read_cached_rds <- function(prefix, key_parts, refresh = FALSE) {
     return(tryCatch(readRDS(path), error = function(...) NULL))
   }
   NULL
+}
+
+cache_exists <- function(prefix, key_parts) {
+  file.exists(cache_file_path(prefix, key_parts))
+}
+
+cache_probe <- function(prefix, key_parts) {
+  path <- cache_file_path(prefix, key_parts)
+  if (!file.exists(path)) {
+    return(list(path = path, exists = FALSE, loadable = FALSE, rows = NA_integer_))
+  }
+  obj <- tryCatch(readRDS(path), error = function(...) NULL)
+  rows <- tryCatch({
+    if (is.data.frame(obj)) nrow(obj) else if (is.matrix(obj)) nrow(obj) else if (is.list(obj) && !is.null(obj$step_table) && is.data.frame(obj$step_table)) nrow(obj$step_table) else NA_integer_
+  }, error = function(...) NA_integer_)
+  list(
+    path = path,
+    exists = TRUE,
+    loadable = !is.null(obj),
+    rows = rows
+  )
 }
 
 write_cached_rds <- function(prefix, key_parts, value) {
@@ -1887,6 +1908,110 @@ build_semgraph_input <- function(unit_id, wgcna_res, gene_map, program_tbl = NUL
   list(graph = graph, data = transformed, unit = unit, input_gene_count = nrow(unit_rows), original_gene_count = nrow(unit$rows))
 }
 
+build_semgraph_runtime_trace <- function(unit_id, trait_cols = NULL, max_model_genes = 500L, annotation_max_genes = 200L,
+                                         reactome_live = FALSE, use_live_string = FALSE, group_col = NULL,
+                                         alpha = 0.05, lfc_cutoff = 0) {
+  code_lines <- c(
+    sprintf("base_input <- build_semgraph_input(unit_id = %s, wgcna_res = wgcna_res, gene_map = gene_map, program_tbl = program_tbl, de_df = de_df, trait_cols = %s, max_genes = %s, alpha = %s, lfc_cutoff = %s)", r_literal(unit_id), r_literal(trait_cols %||% character()), r_literal(max_model_genes), r_literal(alpha), r_literal(lfc_cutoff)),
+    sprintf("group_vec <- pick_binary_group(metadata[match(rownames(base_input$data), metadata$run_id), , drop = FALSE], %s)", r_literal(group_col %||% NULL)),
+    "directed_graph <- igraph::as_directed(base_input$graph, mode = 'arbitrary')",
+    "prior_dag <- SEMgraph::graph2dag(graph = directed_graph, data = base_input$data)",
+    "dag_fit <- SEMgraph::SEMdag(graph = prior_dag, data = base_input$data, LO = 'TO', beta = 0.1)",
+    "dag_graph <- dag_fit$dag",
+    "out_deg <- igraph::degree(dag_graph, mode = 'out')",
+    "in_deg <- igraph::degree(dag_graph, mode = 'in')",
+    "total_deg <- out_deg + in_deg",
+    "focal_gene <- names(sort(total_deg, decreasing = TRUE))[1L]",
+    "upstream_nodes <- SEMgraph::ancestors(dag_graph, focal_gene)",
+    "downstream_nodes <- SEMgraph::descendants(dag_graph, focal_gene)",
+    "parent_nodes <- SEMgraph::parents(dag_graph, focal_gene)",
+    "neighbor_nodes <- igraph::neighbors(dag_graph, focal_gene, mode = 'all')",
+    "neighbor_nodes <- igraph::V(dag_graph)$name[as.integer(neighbor_nodes)]",
+    "local_targets <- unique(c(focal_gene, head(parent_nodes, 8L), head(upstream_nodes, 12L), head(downstream_nodes, 12L), head(neighbor_nodes, 12L)))",
+    "local_targets <- local_targets[local_targets %in% igraph::V(dag_graph)$name]",
+    "gene_lookup <- gene_map[, c('gene_id', 'hgnc_symbol', 'full_gene_name', 'gene_label'), drop = FALSE]",
+    "gene_lookup <- gene_lookup[!is.na(gene_lookup$hgnc_symbol) & nzchar(gene_lookup$hgnc_symbol), , drop = FALSE]",
+    "gene_lookup <- gene_lookup[!duplicated(gene_lookup$hgnc_symbol), , drop = FALSE]",
+    "all_gene_ids <- gene_lookup$gene_id[match(igraph::V(dag_graph)$name, gene_lookup$hgnc_symbol)]",
+    "local_gene_modules <- wgcna_res$gene_modules[match(all_gene_ids, wgcna_res$gene_modules$gene_id), , drop = FALSE]",
+    "local_gene_modules$graph_gene <- igraph::V(dag_graph)$name",
+    "hub_cut <- stats::quantile(local_gene_modules$kWithin, probs = 0.9, na.rm = TRUE)",
+    "local_gene_modules$is_hub <- local_gene_modules$kWithin >= hub_cut",
+    "tf_ann <- annotate_tf_status(local_gene_modules$gene_id, gene_map)",
+    "local_annotations <- merge(local_gene_modules, tf_ann[, c('gene_id', 'is_tf', 'tf_source', 'gene_label', 'full_gene_name', 'hgnc_symbol')], by = 'gene_id', all.x = TRUE, sort = FALSE)",
+    sprintf("annotate_rows <- prioritize_annotation_rows(local_annotations, de_df = de_df, max_genes = %s, alpha = %s, lfc_cutoff = %s)", r_literal(annotation_max_genes), r_literal(alpha), r_literal(lfc_cutoff)),
+    sprintf("drug_ann <- aggregate_drug_annotations(annotate_rows$hgnc_symbol, gene_map = gene_map, refresh = %s, progress = NULL, reactome_live = %s)", r_literal(FALSE), r_literal(reactome_live)),
+    "local_annotations <- merge(local_annotations, drug_ann, by = 'hgnc_symbol', all.x = TRUE, sort = FALSE)",
+    sprintf("edge_validation <- build_edge_validation_table(dag_graph, refresh = %s, use_live_string = %s)", r_literal(FALSE), r_literal(use_live_string)),
+    "if (!is.null(group_vec) && length(local_targets) >= 2L && length(local_targets) <= 25L) {",
+    "  subg <- igraph::induced_subgraph(dag_graph, vids = local_targets)",
+    "  subdata <- base_input$data[, local_targets, drop = FALSE]",
+    "  ace <- SEMgraph::SEMace(graph = subg, data = subdata, group = group_vec)",
+    "}"
+  )
+  step_table <- data.frame(
+    order = seq_along(code_lines),
+    code = code_lines,
+    stringsAsFactors = FALSE
+  )
+  list(code_lines = code_lines, step_table = step_table)
+}
+
+build_semgraph_cache_trace <- function(unit_id, symbols = character(), string_symbols = character(), trait_cols = NULL,
+                                       max_model_genes = 500L, annotation_max_genes = 200L, reactome_live = FALSE,
+                                       use_live_string = FALSE, group_col = NULL, alpha = 0.05, lfc_cutoff = 0,
+                                       refresh_fit = FALSE, refresh_external = FALSE, fit_used_cache = FALSE) {
+  string_file <- locate_string_file()
+  fit_cache_key <- c(
+    "semgraph_fit_v3",
+    unit_id,
+    max_model_genes,
+    group_col %||% "",
+    paste(sort(trait_cols %||% character()), collapse = "|"),
+    ifelse(use_live_string, "live_string", "cached_string"),
+    if (nzchar(string_file) && file.exists(string_file)) paste(basename(string_file), as.numeric(file.info(string_file)$mtime)) else "no_string_file"
+  )
+  string_network_key <- c(string_symbols, string_cache_token(string_file), if (use_live_string) "live_allowed" else "live_disabled")
+  action_candidates <- unique(c(locate_string_action_file(), locate_string_file()))
+  action_candidates <- action_candidates[nzchar(action_candidates) & file.exists(action_candidates)]
+  string_action_key <- c(string_symbols, if (length(action_candidates)) vapply(action_candidates, string_cache_token, character(1)) else "no_action_file")
+  drug_agg_key <- symbols
+  fit_probe <- cache_probe("semgraph_fit", fit_cache_key)
+  string_probe <- cache_probe("string_network", string_network_key)
+  action_probe <- cache_probe("string_actions", string_action_key)
+  drug_probe <- cache_probe("drug_agg", drug_agg_key)
+  code_lines <- c(
+    sprintf("fit_cache_key <- c('semgraph_fit_v3', %s, %s, %s, %s, %s, %s)", r_literal(unit_id), r_literal(max_model_genes), r_literal(group_col %||% ""), r_literal(paste(sort(trait_cols %||% character()), collapse = "|")), r_literal(ifelse(use_live_string, "live_string", "cached_string")), r_literal(if (nzchar(string_file) && file.exists(string_file)) paste(basename(string_file), as.numeric(file.info(string_file)$mtime)) else "no_string_file")),
+    sprintf("string_network_key <- c(%s, %s, %s)", r_literal(string_symbols), r_literal(string_cache_token(string_file)), r_literal(if (use_live_string) "live_allowed" else "live_disabled")),
+    sprintf("string_action_key <- %s", r_literal(string_action_key)),
+    sprintf("drug_agg_key <- %s", r_literal(drug_agg_key)),
+    "# To force full cache regeneration for SEMgraph and its main annotation layers, rerun these with refresh = TRUE:",
+    sprintf("base_input <- build_semgraph_input(unit_id = %s, wgcna_res = wgcna_res, gene_map = gene_map, program_tbl = program_tbl, de_df = de_df, trait_cols = %s, max_genes = %s, alpha = %s, lfc_cutoff = %s)", r_literal(unit_id), r_literal(trait_cols %||% character()), r_literal(max_model_genes), r_literal(alpha), r_literal(lfc_cutoff)),
+    "dag_fit <- NULL  # produced later by SEMgraph::SEMdag(...) in the runtime trace",
+    sprintf("string_network_regenerated <- query_string_network(%s, refresh = TRUE, allow_live = %s)", r_literal(string_symbols), r_literal(use_live_string)),
+    sprintf("string_actions_regenerated <- query_string_actions(%s, refresh = TRUE)", r_literal(string_symbols)),
+    sprintf("drug_annotations_regenerated <- aggregate_drug_annotations(%s, gene_map = gene_map, refresh = TRUE, progress = NULL, reactome_live = %s)", r_literal(symbols), r_literal(reactome_live)),
+    sprintf("semgraph_fit_refreshed <- run_semgraph_analysis(unit_id = %s, wgcna_res = wgcna_res, gene_map = gene_map, metadata = metadata, program_tbl = program_tbl, de_df = de_df, trait_cols = %s, refresh_external = TRUE, refresh_fit = TRUE, max_model_genes = %s, annotation_max_genes = %s, reactome_live = %s, use_live_string = %s, group_col = %s, alpha = %s, lfc_cutoff = %s, progress = NULL)", r_literal(unit_id), r_literal(trait_cols %||% character()), r_literal(max_model_genes), r_literal(annotation_max_genes), r_literal(reactome_live), r_literal(use_live_string), r_literal(group_col %||% NULL), r_literal(alpha), r_literal(lfc_cutoff))
+  )
+  status_table <- data.frame(
+    cache_layer = c("semgraph_fit", "string_network", "string_actions", "drug_agg"),
+    cache_path = c(fit_probe$path, string_probe$path, action_probe$path, drug_probe$path),
+    cache_file_exists = c(fit_probe$exists, string_probe$exists, action_probe$exists, drug_probe$exists),
+    cache_file_loadable = c(fit_probe$loadable, string_probe$loadable, action_probe$loadable, drug_probe$loadable),
+    cached_rows_if_tabular = c(fit_probe$rows, string_probe$rows, action_probe$rows, drug_probe$rows),
+    refresh_requested = c(refresh_fit, refresh_external, refresh_external, refresh_external),
+    used_cache_in_this_run = c(fit_used_cache && !refresh_fit, NA, NA, NA),
+    note = c(
+      if (fit_used_cache && !refresh_fit) "The SEMgraph fit object itself was loaded from cache in this run." else "The SEMgraph fit object was recomputed in this run unless the file was only probed for availability.",
+      "This row reports whether a usable STRING network cache file exists. It does not claim the file was definitely used in this run unless separately tracked.",
+      "This row reports whether a usable STRING action cache file exists. It does not claim the file was definitely used in this run unless separately tracked.",
+      "This row reports whether a usable aggregated drug-annotation cache file exists. It does not claim the file was definitely used in this run unless separately tracked."
+    ),
+    stringsAsFactors = FALSE
+  )
+  list(code_lines = code_lines, status_table = status_table)
+}
+
 run_semgraph_analysis <- function(unit_id, wgcna_res, gene_map, metadata, program_tbl = NULL, de_df = NULL, trait_cols = NULL, refresh_external = FALSE, refresh_fit = FALSE, max_model_genes = 500L, annotation_max_genes = 200L, reactome_live = FALSE, use_live_string = FALSE, group_col = NULL, alpha = 0.05, lfc_cutoff = 0, progress = NULL) {
   string_file <- locate_string_file()
   string_stamp <- if (nzchar(string_file) && file.exists(string_file)) paste(basename(string_file), as.numeric(file.info(string_file)$mtime)) else "no_string_file"
@@ -1904,6 +2029,35 @@ run_semgraph_analysis <- function(unit_id, wgcna_res, gene_map, metadata, progra
     if (!is.null(cached)) {
       if (!is.null(progress)) progress(0.85, "Refreshing external edge validation on cached SEMgraph fit")
       cached$edge_validation <- build_edge_validation_table(cached$graph, refresh = refresh_external, use_live_string = use_live_string)
+      cached$workflow_trace <- build_semgraph_runtime_trace(
+        unit_id = unit_id,
+        trait_cols = trait_cols,
+        max_model_genes = max_model_genes,
+        annotation_max_genes = annotation_max_genes,
+        reactome_live = reactome_live,
+        use_live_string = use_live_string,
+        group_col = group_col,
+        alpha = alpha,
+        lfc_cutoff = lfc_cutoff
+      )
+      ann_symbols <- tryCatch(unique(cached$local_annotations$hgnc_symbol[!is.na(cached$local_annotations$hgnc_symbol) & nzchar(cached$local_annotations$hgnc_symbol)]), error = function(...) character())
+      graph_symbols <- tryCatch(unique(igraph::V(cached$graph)$name), error = function(...) character())
+      cached$cache_trace <- build_semgraph_cache_trace(
+        unit_id = unit_id,
+        symbols = ann_symbols,
+        string_symbols = graph_symbols,
+        trait_cols = trait_cols,
+        max_model_genes = max_model_genes,
+        annotation_max_genes = annotation_max_genes,
+        reactome_live = reactome_live,
+        use_live_string = use_live_string,
+        group_col = group_col,
+        alpha = alpha,
+        lfc_cutoff = lfc_cutoff,
+        refresh_fit = refresh_fit,
+        refresh_external = refresh_external,
+        fit_used_cache = TRUE
+      )
       if (!is.null(progress)) progress(0.95, "Loaded cached SEMgraph fit")
       return(cached)
     }
@@ -2042,7 +2196,34 @@ run_semgraph_analysis <- function(unit_id, wgcna_res, gene_map, metadata, progra
     analysis_unit_type = base_input$unit$type,
     source_modules = base_input$unit$source_modules,
     semgraph_input_gene_count = base_input$input_gene_count,
-    semgraph_original_gene_count = base_input$original_gene_count
+    semgraph_original_gene_count = base_input$original_gene_count,
+    workflow_trace = build_semgraph_runtime_trace(
+      unit_id = unit_id,
+      trait_cols = trait_cols,
+      max_model_genes = max_model_genes,
+      annotation_max_genes = annotation_max_genes,
+      reactome_live = reactome_live,
+      use_live_string = use_live_string,
+      group_col = group_col,
+      alpha = alpha,
+      lfc_cutoff = lfc_cutoff
+    ),
+    cache_trace = build_semgraph_cache_trace(
+      unit_id = unit_id,
+      symbols = unique(annotate_rows$hgnc_symbol[!is.na(annotate_rows$hgnc_symbol) & nzchar(annotate_rows$hgnc_symbol)]),
+      string_symbols = unique(igraph::V(dag_graph)$name),
+      trait_cols = trait_cols,
+      max_model_genes = max_model_genes,
+      annotation_max_genes = annotation_max_genes,
+      reactome_live = reactome_live,
+      use_live_string = use_live_string,
+      group_col = group_col,
+      alpha = alpha,
+      lfc_cutoff = lfc_cutoff,
+      refresh_fit = refresh_fit,
+      refresh_external = refresh_external,
+      fit_used_cache = FALSE
+    )
   )
   if (!is.null(progress)) progress(0.97, "Saving SEMgraph fit to cache")
   write_cached_rds("semgraph_fit", fit_cache_key, out)
@@ -6132,8 +6313,20 @@ server <- function(input, output, session) {
       out$wgcna <- list(
         module_sizes = data.frame(module = names(wres$module_sizes), genes = as.numeric(wres$module_sizes), stringsAsFactors = FALSE),
         selected_module = input$wgcna_module_view,
-        gene_modules = wres$gene_modules
+        gene_modules = wres$gene_modules,
+        programs = wgcna_programs()
       )
+      selected_prog <- tryCatch(selected_wgcna_program(), error = function(...) NULL)
+      if (!is.null(selected_prog)) {
+        out$wgcna$selected_program <- list(
+          name = selected_prog$name,
+          modules = selected_prog$modules,
+          rationale = selected_prog$rationale,
+          gene_table = selected_prog$gene_table,
+          trait_cor = selected_prog$trait_cor,
+          trait_p = selected_prog$trait_p
+        )
+      }
       if (nzchar(input$wgcna_module_view)) {
         mod_graph <- build_wgcna_module_graph(wres, input$wgcna_module_view, edge_quantile = input$wgcna_edge_quantile)
         if (!is.null(mod_graph)) {
@@ -6151,6 +6344,41 @@ server <- function(input, output, session) {
     }
 
     if (!is.null(sres)) {
+      de_df_now <- tryCatch(de()$df, error = function(...) NULL)
+      alpha_now <- input$de_alpha %||% 0.05
+      lfc_now <- input$de_lfc_cutoff %||% 0
+      base_sel <- select_semgraph_graph_nodes(
+        sres,
+        de_df = de_df_now,
+        display_mode = input$semgraph_display_mode,
+        graph_scope = input$semgraph_graph_scope,
+        max_nodes = input$semgraph_graph_max_nodes,
+        start_gene = input$semgraph_start_gene,
+        end_gene = input$semgraph_end_gene,
+        hops = input$semgraph_neighbor_hops %||% 2L,
+        path_n = input$semgraph_path_n %||% 5L,
+        path_max_steps = input$semgraph_path_max_steps %||% 6L,
+        selected_nodes = character(),
+        selected_hops = 3L,
+        selected_only = FALSE,
+        filter_tf = FALSE,
+        filter_druggable = FALSE,
+        filter_hub_mode = "off",
+        focal_top_n = 0L,
+        restrict_to_focus = FALSE,
+        alpha = alpha_now,
+        lfc_cutoff = lfc_now
+      )
+      base_nodes <- base_sel$nodes[base_sel$nodes %in% igraph::V(sres$graph)$name]
+      base_graph <- igraph::induced_subgraph(sres$graph, vids = base_nodes)
+      if (igraph::vcount(base_graph) > 0L) {
+        base_lay <- compute_semgraph_layout(base_graph, method = input$semgraph_layout)
+        base_node_df <- data.frame(x = base_lay[, 1], y = base_lay[, 2], gene = igraph::V(base_graph)$name, stringsAsFactors = FALSE)
+        base_node_df$role <- ifelse(base_node_df$gene == sres$focal_gene, "focal anchor", ifelse(base_node_df$gene %in% sres$upstream, "upstream candidate", ifelse(base_node_df$gene %in% sres$downstream, "downstream candidate", "context gene")))
+      } else {
+        base_node_df <- data.frame(x = numeric(), y = numeric(), gene = character(), role = character(), stringsAsFactors = FALSE)
+      }
+      base_edge_tbl <- annotate_semgraph_edges(base_graph, sres)
       sel <- semgraph_graph_selection()
       sub_nodes <- sel$nodes[sel$nodes %in% igraph::V(sres$graph)$name]
       sg <- igraph::induced_subgraph(sres$graph, vids = sub_nodes)
@@ -6174,6 +6402,20 @@ server <- function(input, output, session) {
       out$semgraph <- list(
         analysis_unit = sres$analysis_unit,
         focal_gene = sres$focal_gene,
+        report_state = list(
+          display_mode = input$semgraph_display_mode,
+          graph_scope = input$semgraph_graph_scope,
+          layout = input$semgraph_layout,
+          max_nodes = input$semgraph_graph_max_nodes,
+          start_gene = input$semgraph_start_gene,
+          end_gene = input$semgraph_end_gene,
+          hops = input$semgraph_neighbor_hops %||% 2L,
+          path_n = input$semgraph_path_n %||% 5L,
+          path_max_steps = input$semgraph_path_max_steps %||% 6L,
+          string_cutoff = input$semgraph_string_cutoff %||% 0.7,
+          filter_state = semgraph_filter_state(),
+          color_state = semgraph_color_state()
+        ),
         degree_table = tryCatch({
           df <- sres$degree_df
           df[df$gene %in% select_semgraph_table_nodes(sres, tryCatch(de()$df, error = function(...) NULL), scope = input$semgraph_table_scope, max_rows = input$semgraph_table_max_rows, alpha = input$de_alpha %||% 0.05, lfc_cutoff = input$de_lfc_cutoff %||% 0), , drop = FALSE]
@@ -6183,6 +6425,11 @@ server <- function(input, output, session) {
         }, error = function(...) data.frame()),
         ace_table = sres$ace,
         pathway_summary = tryCatch(semgraph_pathway_context()$summary, error = function(...) data.frame()),
+        workflow_trace = sres$workflow_trace,
+        base_graph = list(
+          nodes = base_node_df,
+          edges = base_edge_tbl
+        ),
         graph = list(
           nodes = node_df,
           edges = sg_edges
@@ -6197,8 +6444,10 @@ server <- function(input, output, session) {
     dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
     tables_dir <- file.path(out_dir, "tables")
     plots_dir <- file.path(out_dir, "plots")
+    inputs_dir <- file.path(out_dir, "inputs")
     dir.create(tables_dir, recursive = TRUE, showWarnings = FALSE)
     dir.create(plots_dir, recursive = TRUE, showWarnings = FALSE)
+    dir.create(inputs_dir, recursive = TRUE, showWarnings = FALSE)
     saveRDS(snapshot, file.path(out_dir, "report_snapshot.rds"))
     utils::write.csv(snapshot$package_versions, file.path(out_dir, "package_versions.csv"), row.names = FALSE)
     utils::write.csv(snapshot$analysis_log, file.path(out_dir, "analysis_log.csv"), row.names = FALSE)
@@ -6218,10 +6467,67 @@ server <- function(input, output, session) {
     }
     load_counts_path <- snapshot$inputs$counts_path %||% load_params$counts_path %||% ""
     load_meta_path <- snapshot$inputs$metadata_path %||% load_params$metadata_path %||% ""
+    bundle_input_copy <- function(src, fallback_name) {
+      if (is.null(src) || !nzchar(src) || !file.exists(src)) {
+        return(list(
+          source = src %||% "",
+          bundled = FALSE,
+          relative = src %||% "",
+          basename = ""
+        ))
+      }
+      dest_name <- basename(src)
+      if (!nzchar(dest_name)) dest_name <- fallback_name
+      dest_path <- file.path(inputs_dir, dest_name)
+      ok <- isTRUE(file.copy(src, dest_path, overwrite = TRUE))
+      list(
+        source = src,
+        bundled = ok,
+        relative = if (ok) file.path("inputs", dest_name) else src,
+        basename = if (ok) dest_name else basename(src)
+      )
+    }
+    bundled_counts <- bundle_input_copy(load_counts_path, "counts_matrix.csv")
+    bundled_meta <- bundle_input_copy(load_meta_path, "metadata.csv")
+    utils::write.csv(
+      data.frame(
+        file_role = c("counts", "metadata"),
+        original_path = c(bundled_counts$source, bundled_meta$source),
+        bundled_relative_path = c(bundled_counts$relative, bundled_meta$relative),
+        bundled = c(bundled_counts$bundled, bundled_meta$bundled),
+        stringsAsFactors = FALSE
+      ),
+      file.path(out_dir, "input_files_manifest.csv"),
+      row.names = FALSE
+    )
+    report_counts_path <- bundled_counts$relative
+    report_meta_path <- bundled_meta$relative
+    setup_code_lines <- c(
+      "source('report_methods.R')",
+      "required_packages <- c(",
+      "  'AnnotationDbi', 'org.Hs.eg.db', 'DESeq2', 'SummarizedExperiment',",
+      "  'clusterProfiler', 'WGCNA', 'dynamicTreeCut', 'plotly', 'jsonlite'",
+      ")",
+      "check_required_packages(required_packages)"
+    )
+    snapshot_provenance_code_lines <- c(
+      "source('report_methods.R')",
+      "# In the Shiny app, this report snapshot was generated after the selected analyses had already been run.",
+      "# The app-side export logic is conceptually:",
+      "# snapshot <- current_report_snapshot()",
+      "# saveRDS(snapshot, 'report_snapshot.rds')",
+      "#",
+      "# In a standalone R session you do not recreate current_report_snapshot() directly, because it depends on the live Shiny state.",
+      "# Instead, you use report_snapshot.rds as the frozen handoff object that records the completed app state.",
+      "snap <- readRDS('report_snapshot.rds')",
+      "snapshot_overview <- explain_report_snapshot(snap)",
+      "snapshot_overview",
+      "head(snap$analysis_log)"
+    )
     qc_code_lines <- c(
       "source('report_methods.R')",
-      sprintf("counts_path <- %s", r_literal(load_counts_path)),
-      sprintf("metadata_path <- %s", r_literal(load_meta_path)),
+      sprintf("counts_path <- %s", r_literal(report_counts_path)),
+      sprintf("metadata_path <- %s", r_literal(report_meta_path)),
       sprintf("min_count <- %s", r_literal(snapshot$inputs$min_count %||% load_params$min_count %||% 10)),
       sprintf("min_samples <- %s", r_literal(snapshot$inputs$min_samples %||% load_params$min_samples %||% 2)),
       "cur <- read_inputs(counts_path, metadata_path, min_count, min_samples)",
@@ -6241,8 +6547,8 @@ server <- function(input, output, session) {
     )
     de_code_lines <- c(
       "source('report_methods.R')",
-      sprintf("counts_path <- %s", r_literal(load_counts_path)),
-      sprintf("metadata_path <- %s", r_literal(load_meta_path)),
+      sprintf("counts_path <- %s", r_literal(report_counts_path)),
+      sprintf("metadata_path <- %s", r_literal(report_meta_path)),
       sprintf("min_count <- %s", r_literal(snapshot$inputs$min_count %||% load_params$min_count %||% 10)),
       sprintf("min_samples <- %s", r_literal(snapshot$inputs$min_samples %||% load_params$min_samples %||% 2)),
       "cur <- read_inputs(counts_path, metadata_path, min_count, min_samples)",
@@ -6313,16 +6619,120 @@ server <- function(input, output, session) {
       "module_plot_df <- data.frame(gene_id = module_gene_ids, kWithin = as.numeric(module_kwithin), stringsAsFactors = FALSE)",
       "module_plot_df <- attach_gene_labels(module_plot_df, cur$gene_map)"
     )
+    program_code_lines <- {
+      selected_program_name <- tryCatch(snapshot$wgcna$selected_program$name, error = function(...) "")
+      selected_program_modules <- tryCatch(snapshot$wgcna$selected_program$modules, error = function(...) character())
+      c(
+        "source('report_methods.R')",
+        "snap <- readRDS('report_snapshot.rds')",
+        "# Run the QC and WGCNA blocks above first so `cur` and `module_colors` are available.",
+        sprintf("program_name <- %s", r_literal(selected_program_name %||% "")),
+        sprintf("program_modules <- %s", r_literal(selected_program_modules %||% character())),
+        "program_tbl <- snap$wgcna$programs %||% data.frame()",
+        "selected_program <- reconstruct_saved_program(snap, program_name)",
+        "selected_program$summary",
+        "head(selected_program$gene_table)"
+      )
+    }
     semgraph_code_lines <- c(
       "source('report_methods.R')",
-      "# Run the QC and WGCNA blocks above first so `cur` and `module_colors` are available.",
+      "base_dir <- '.'",
+      "logs <- read_bundle_analysis_log(base_dir)",
+      sprintf("counts_path <- %s", r_literal(report_counts_path)),
+      sprintf("metadata_path <- %s", r_literal(report_meta_path)),
+      sprintf("min_count <- %s", r_literal(snapshot$inputs$min_count %||% load_params$min_count %||% 10)),
+      sprintf("min_samples <- %s", r_literal(snapshot$inputs$min_samples %||% load_params$min_samples %||% 2)),
+      "cur <- read_inputs(counts_path, metadata_path, min_count, min_samples)",
+      "de_params <- get_last_log_params_from_table(logs, 'run_deseq2')",
+      "wgcna_params <- get_last_log_params_from_table(logs, 'run_wgcna')",
+      "semgraph_params <- get_last_log_params_from_table(logs, 'run_semgraph')",
+      sprintf("alpha <- %s", r_literal(snapshot$inputs$de_alpha %||% de_params$alpha %||% 0.05)),
+      sprintf("lfc_cutoff <- %s", r_literal(snapshot$inputs$de_lfc_cutoff %||% de_params$abs_log2fc_cutoff %||% 0)),
+      sprintf("selected_samples <- %s", r_literal(de_params$selected_samples %||% character())),
+      sprintf("formula_str <- %s", r_literal(design_formula)),
+      sprintf("contrast_var <- %s", r_literal(de_params$comparison_variable %||% NULL)),
+      sprintf("contrast_num <- %s", r_literal(de_params$numerator %||% NULL)),
+      sprintf("contrast_den <- %s", r_literal(de_params$denominator %||% NULL)),
+      "de_res <- run_de(cur$filtered, cur$meta, samples = selected_samples, formula_str = formula_str, gene_map = cur$gene_map, var = contrast_var, num = contrast_num, den = contrast_den)",
+      "wgcna_rebuilt <- rebuild_wgcna_from_params(wgcna_params, cur)",
       sprintf("analysis_unit <- %s", r_literal(semgraph_params$analysis_unit %||% snapshot$semgraph$analysis_unit %||% "")),
       sprintf("display_mode <- %s", r_literal(semgraph_params$display_mode %||% "de_connectors")),
       sprintf("max_model_genes <- %s", r_literal(semgraph_params$max_model_genes %||% 300)),
       sprintf("max_annotation_genes <- %s", r_literal(semgraph_params$max_annotation_genes %||% 180)),
       sprintf("use_live_string <- %s", r_literal(semgraph_params$use_live_string %||% FALSE)),
-      "# The app then prioritizes genes, builds a prior graph from the selected WGCNA unit, orients it to a DAG with SEMgraph, and annotates the resulting edges with STRING support and STRING action data when available.",
-      "# See the exported semgraph graph/table files for the exact visible state that was rendered in the app."
+      "semgraph_input <- rebuild_semgraph_input_chain_from_bundle(base_dir, cur, de_res, wgcna_rebuilt, analysis_unit = analysis_unit)",
+      "semgraph_input$continuity",
+      "semgraph_input$argument_trace",
+      "semgraph_input$algorithm_logic",
+      "semgraph_input$summary",
+      "head(semgraph_input$gene_table)",
+      "unit_obj <- resolve_semgraph_unit_from_bundle(base_dir, analysis_unit, wgcna_rebuilt, cur$gene_map, de_df = de_res$df, alpha = alpha, lfc_cutoff = lfc_cutoff)",
+      "prioritized_rows <- prioritize_semgraph_rows(unit_obj$rows, de_df = de_res$df, max_genes = max_model_genes, alpha = alpha, lfc_cutoff = lfc_cutoff)",
+      "head(prioritized_rows)",
+      "expr <- wgcna_rebuilt$dat_expr[, prioritized_rows$gene_id, drop = FALSE]",
+      "colnames(expr) <- prioritized_rows$hgnc_symbol",
+      "corr <- stats::cor(expr, use = 'pairwise.complete.obs')",
+      "diag(corr) <- 0",
+      "corr_threshold <- stats::quantile(abs(corr[upper.tri(corr)]), probs = 0.75, na.rm = TRUE)",
+      "adj <- abs(corr) >= corr_threshold",
+      "diag(adj) <- 0",
+      "prior_graph <- igraph::graph_from_adjacency_matrix(adj, mode = 'undirected', diag = FALSE)",
+      "prior_graph <- igraph::delete_vertices(prior_graph, igraph::V(prior_graph)[igraph::degree(prior_graph) == 0])",
+      "expr_for_semgraph <- expr[, igraph::V(prior_graph)$name, drop = FALSE]",
+      "semgraph_data <- SEMgraph::transformData(expr_for_semgraph)$data",
+      "metadata_aligned <- cur$meta[match(rownames(semgraph_data), cur$meta$run_id), , drop = FALSE]",
+      "group_vec <- pick_binary_group(metadata_aligned, semgraph_params$group %||% NULL)",
+      "directed_graph <- igraph::as_directed(prior_graph, mode = 'arbitrary')",
+      "prior_dag <- SEMgraph::graph2dag(graph = directed_graph, data = semgraph_data)",
+      "dag_fit <- SEMgraph::SEMdag(graph = prior_dag, data = semgraph_data, LO = 'TO', beta = 0.1)",
+      "dag_graph <- dag_fit$dag",
+      "out_degree <- igraph::degree(dag_graph, mode = 'out')",
+      "in_degree <- igraph::degree(dag_graph, mode = 'in')",
+      "total_degree <- out_degree + in_degree",
+      "focal_gene <- names(sort(total_degree, decreasing = TRUE))[1L]",
+      "upstream_nodes <- SEMgraph::ancestors(dag_graph, focal_gene)",
+      "downstream_nodes <- SEMgraph::descendants(dag_graph, focal_gene)",
+      "local_semgraph_summary <- data.frame(",
+      "  metric = c('analysis_unit', 'genes_entering_semgraph', 'corr_threshold', 'dag_nodes', 'dag_edges', 'focal_gene', 'binary_group_used'),",
+      "  value = c(",
+      "    analysis_unit,",
+      "    ncol(semgraph_data),",
+      "    signif(corr_threshold, 4),",
+      "    igraph::vcount(dag_graph),",
+      "    igraph::ecount(dag_graph),",
+      "    focal_gene,",
+      "    if (is.null(group_vec)) 'no binary group used' else semgraph_params$group %||% 'binary group present'",
+      "  ),",
+      "  stringsAsFactors = FALSE",
+      ")",
+      "local_semgraph_summary",
+      "bundle_semgraph <- read_bundle_semgraph_context(base_dir)",
+      "bundle_semgraph$report_state",
+      "head(bundle_semgraph$base_graph$nodes)",
+      "head(bundle_semgraph$base_graph$edges)",
+      "head(bundle_semgraph$graph$edges)",
+      "head(bundle_semgraph$graph$nodes)",
+      "head(bundle_semgraph$degree_table)",
+      "head(bundle_semgraph$edge_validation_table)",
+      "head(bundle_semgraph$pathway_summary)",
+      "snap <- readRDS('report_snapshot.rds')",
+      "semgraph_report <- validate_semgraph_snapshot(snap, analysis_unit = analysis_unit)",
+      "semgraph_report$summary",
+      "semgraph_report$checks",
+      "semgraph_views <- rebuild_semgraph_report_views(snap)",
+      "semgraph_views$state",
+      "initial_semgraph_nodes <- semgraph_views$initial_graph$nodes",
+      "initial_semgraph_edges <- semgraph_views$initial_graph$edges",
+      "filtered_semgraph_nodes <- semgraph_views$filtered_graph$nodes",
+      "filtered_semgraph_edges <- semgraph_views$filtered_graph$edges",
+      "semgraph_views$filtered_edges_from_base",
+      "visible_semgraph_nodes <- semgraph_report$graph$nodes",
+      "visible_semgraph_edges <- semgraph_report$graph$edges",
+      "semgraph_degree_table <- semgraph_report$degree_table",
+      "semgraph_edge_validation <- semgraph_report$edge_validation",
+      "semgraph_pathway_summary <- semgraph_report$pathway_summary",
+      "# This report-level execution path first rebuilds the explicit upstream SEMgraph input chain from counts and metadata, then shows the near-verbatim internal SEMgraph fit calls (transformData, graph2dag, SEMdag, local regulator extraction), and finally exposes the exported graph/tables that were actually displayed in the app.",
+      "# For the exact rendered state, also inspect the exported semgraph HTML graph and the CSV tables in this bundle."
     )
 
     if (!is.null(snapshot$qc)) {
@@ -6340,16 +6750,129 @@ server <- function(input, output, session) {
     if (!is.null(snapshot$wgcna)) {
       utils::write.csv(snapshot$wgcna$module_sizes, file.path(tables_dir, "wgcna_module_sizes.csv"), row.names = FALSE)
       utils::write.csv(snapshot$wgcna$gene_modules, file.path(tables_dir, "wgcna_gene_modules.csv"), row.names = FALSE)
+      if (!is.null(snapshot$wgcna$programs)) {
+        utils::write.csv(snapshot$wgcna$programs, file.path(tables_dir, "wgcna_programs.csv"), row.names = FALSE)
+      }
+      if (!is.null(snapshot$wgcna$selected_program) && !is.null(snapshot$wgcna$selected_program$gene_table)) {
+        utils::write.csv(snapshot$wgcna$selected_program$gene_table, file.path(tables_dir, "wgcna_selected_program_gene_table.csv"), row.names = FALSE)
+        utils::write.csv(
+          data.frame(
+            name = snapshot$wgcna$selected_program$name %||% "",
+            modules = paste(snapshot$wgcna$selected_program$modules %||% character(), collapse = " + "),
+            rationale = snapshot$wgcna$selected_program$rationale %||% "",
+            stringsAsFactors = FALSE
+          ),
+          file.path(tables_dir, "wgcna_selected_program_summary.csv"),
+          row.names = FALSE
+        )
+      }
     }
     if (!is.null(snapshot$semgraph)) {
       utils::write.csv(snapshot$semgraph$degree_table, file.path(tables_dir, "semgraph_degree_table.csv"), row.names = FALSE)
       utils::write.csv(snapshot$semgraph$edge_validation_table, file.path(tables_dir, "semgraph_edge_validation_table.csv"), row.names = FALSE)
       utils::write.csv(snapshot$semgraph$ace_table, file.path(tables_dir, "semgraph_effects_table.csv"), row.names = FALSE)
       utils::write.csv(snapshot$semgraph$pathway_summary, file.path(tables_dir, "semgraph_pathway_summary.csv"), row.names = FALSE)
+      utils::write.csv(snapshot$semgraph$graph$nodes %||% data.frame(), file.path(tables_dir, "semgraph_graph_nodes.csv"), row.names = FALSE)
+      utils::write.csv(snapshot$semgraph$graph$edges %||% data.frame(), file.path(tables_dir, "semgraph_graph_edges.csv"), row.names = FALSE)
+      utils::write.csv(snapshot$semgraph$base_graph$nodes %||% data.frame(), file.path(tables_dir, "semgraph_base_graph_nodes.csv"), row.names = FALSE)
+      utils::write.csv(snapshot$semgraph$base_graph$edges %||% data.frame(), file.path(tables_dir, "semgraph_base_graph_edges.csv"), row.names = FALSE)
+      utils::write.csv(
+        data.frame(
+          analysis_unit = snapshot$semgraph$analysis_unit %||% "",
+          focal_gene = snapshot$semgraph$focal_gene %||% "",
+          stringsAsFactors = FALSE
+        ),
+        file.path(tables_dir, "semgraph_metadata.csv"),
+        row.names = FALSE
+      )
+      utils::write.csv(
+        data.frame(
+          key = names(snapshot$semgraph$report_state %||% list()),
+          value = vapply(snapshot$semgraph$report_state %||% list(), function(x) paste(as.character(x), collapse = "; "), character(1)),
+          stringsAsFactors = FALSE
+        ),
+        file.path(tables_dir, "semgraph_report_state.csv"),
+        row.names = FALSE
+      )
+      if (!is.null(snapshot$semgraph$workflow_trace)) {
+        utils::write.csv(snapshot$semgraph$workflow_trace$step_table %||% data.frame(), file.path(tables_dir, "semgraph_runtime_trace.csv"), row.names = FALSE)
+        write_text_file(file.path(out_dir, "semgraph_runtime_trace.R"), snapshot$semgraph$workflow_trace$code_lines %||% character())
+      }
+      if (!is.null(snapshot$semgraph$cache_trace)) {
+        utils::write.csv(snapshot$semgraph$cache_trace$status_table %||% data.frame(), file.path(tables_dir, "semgraph_cache_status.csv"), row.names = FALSE)
+        write_text_file(file.path(out_dir, "semgraph_cache_regeneration.R"), snapshot$semgraph$cache_trace$code_lines %||% character())
+      }
     }
 
     report_methods_lines <- c(
       "`%||%` <- function(x, y) if (is.null(x)) y else x",
+      "",
+      "check_required_packages <- function(pkgs) {",
+      "  missing <- pkgs[!vapply(pkgs, requireNamespace, logical(1), quietly = TRUE)]",
+      "  if (length(missing)) stop(sprintf('Install the following required packages before rerunning this bundle: %s', paste(missing, collapse = ', ')), call. = FALSE)",
+      "  invisible(TRUE)",
+      "}",
+      "",
+      "explain_report_snapshot <- function(snap) {",
+      "  analysis_steps <- tryCatch(unique(snap$analysis_log$step), error = function(...) character())",
+      "  semgraph_unit <- tryCatch(snap$semgraph$analysis_unit %||% '', error = function(...) '')",
+      "  data.frame(",
+      "    metric = c(",
+      "      'generated_at',",
+      "      'analysis_steps_recorded',",
+      "      'contains_qc_outputs',",
+      "      'contains_deseq2_outputs',",
+      "      'contains_enrichment_outputs',",
+      "      'contains_wgcna_outputs',",
+      "      'contains_semgraph_outputs',",
+      "      'semgraph_analysis_unit'",
+      "    ),",
+      "    value = c(",
+      "      as.character(snap$generated_at %||% ''),",
+      "      paste(analysis_steps, collapse = ', '),",
+      "      !is.null(snap$qc),",
+      "      !is.null(snap$de),",
+      "      !is.null(snap$enrichment),",
+      "      !is.null(snap$wgcna),",
+      "      !is.null(snap$semgraph),",
+      "      semgraph_unit",
+      "    ),",
+      "    stringsAsFactors = FALSE",
+      "  )",
+      "}",
+      "",
+      "explain_semgraph_algorithm <- function() {",
+      "  data.frame(",
+      "    stage = c(",
+      "      '1. Define the prior gene universe',",
+      "      '2. Build the graph-informed prior context',",
+      "      '3. Orient the prior toward a DAG',",
+      "      '4. Fit the SEMgraph model',",
+      "      '5. Prioritize local upstream and downstream structure',",
+      "      '6. Add external support and biological context',",
+      "      '7. Export the visible graph and tables'",
+      "    ),",
+      "    what_happens = c(",
+      "      'The selected WGCNA module or combined program defines which genes are allowed to enter the SEMgraph analysis unit.',",
+      "      'Those genes provide the graph-informed context that SEMgraph later orients and filters into an interpretable local causal neighborhood.',",
+      "      'SEMgraph converts the graph context into a directed acyclic structure under modeling assumptions so arrow directions can be proposed.',",
+      "      'The directed structure is combined with the expression data so SEMgraph can rank regulator-like and responder-like genes.',",
+      "      'The app then extracts a focused local neighborhood around the focal regulator and marks upstream versus downstream candidates.',",
+      "      'STRING support, action data, druggability, and pathway context are overlaid after the SEMgraph fit so they validate or annotate the predicted graph rather than creating it.',",
+      "      'The final exported graph and tables preserve the exact visible SEMgraph state shown in the app, including later filter settings.'",
+      "    ),",
+      "    how_to_interpret = c(",
+      "      'This step decides which genes SEMgraph is allowed to reason about.',",
+      "      'The prior graph is guidance, not proof by itself.',",
+      "      'Arrow directions are model-based hypotheses, not direct measurements from RNA-seq alone.',",
+      "      'Genes with more outgoing edges are more regulator-like in the fitted local graph, while genes with more incoming edges are more responder-like.',",
+      "      'The displayed subgraph is an interpretable local view, not necessarily the full fitted graph.',",
+      "      'External databases support plausibility and mechanism context, but they do not replace the SEMgraph direction logic.',",
+      "      'This is the state the report validates and the user can inspect or export.'",
+      "    ),",
+      "    stringsAsFactors = FALSE",
+      "  )",
+      "}",
       "",
       "map_gene_symbols <- function(gene_ids) {",
       "  clean_ids <- sub('\\\\..*$', '', gene_ids)",
@@ -6389,11 +6912,22 @@ server <- function(input, output, session) {
       "  log_cpm <- log2(sweep(filtered, 2L, lib / 1e6, '/') + 1)",
       "  pca <- prcomp(t(log_cpm), center = TRUE, scale. = TRUE)",
       "  gene_map <- map_gene_symbols(rownames(counts))",
-      "  list(counts = counts, filtered = filtered, meta = meta, log_cpm = log_cpm, pca = pca, gene_map = gene_map)",
+      "  list(counts = counts, filtered = filtered, meta = meta, log_cpm = log_cpm, pca = pca, gene_map = gene_map, counts_path = counts_path, metadata_path = meta_path, min_count = min_count, min_samples = min_samples)",
       "}",
       "",
       "deg_mask <- function(df, alpha = 0.05, lfc_cutoff = 0) {",
       "  !is.na(df$padj) & df$padj < alpha & !is.na(df$log2FoldChange) & abs(df$log2FoldChange) >= lfc_cutoff",
+      "}",
+      "",
+      "filter_validated_edges <- function(edge_df, mode = 'all', string_cutoff = 0.7) {",
+      "  if (is.null(edge_df) || !nrow(edge_df)) return(edge_df)",
+      "  keep <- switch(",
+      "    mode,",
+      "    any_support = edge_df$string_supported,",
+      "    string_only = edge_df$string_supported & edge_df$string_score >= string_cutoff,",
+      "    rep(TRUE, nrow(edge_df))",
+      "  )",
+      "  edge_df[keep, , drop = FALSE]",
       "}",
       "",
       "run_de <- function(counts, meta, samples, formula_str, gene_map, var = NULL, num = NULL, den = NULL) {",
@@ -6409,12 +6943,448 @@ server <- function(input, output, session) {
       "  df <- as.data.frame(res); df$gene_id <- rownames(df); df <- attach_gene_labels(df, gene_map)",
       "  vst_obj <- DESeq2::vst(dds, blind = TRUE)",
       "  list(df = df, vst = SummarizedExperiment::assay(vst_obj), size_factors = DESeq2::sizeFactors(dds))",
+      "}",
+      "",
+      "reconstruct_saved_program <- function(snap, program_name) {",
+      "  stopifnot(!is.null(snap$wgcna))",
+      "  prog_tbl <- snap$wgcna$programs %||% data.frame()",
+      "  if (!nrow(prog_tbl) || !nzchar(program_name) || !program_name %in% prog_tbl$name) stop('Requested combined program is not present in the report snapshot.')",
+      "  row <- prog_tbl[prog_tbl$name == program_name, , drop = FALSE]",
+      "  modules <- trimws(unlist(strsplit(row$modules[1L], '\\\\+', perl = TRUE)))",
+      "  modules <- modules[nzchar(modules)]",
+      "  if (!is.null(snap$wgcna$selected_program) && identical(snap$wgcna$selected_program$name, program_name)) {",
+      "    gene_table <- snap$wgcna$selected_program$gene_table %||% data.frame()",
+      "  } else {",
+      "    gene_table <- snap$wgcna$gene_modules",
+      "    gene_table <- gene_table[gene_table$module %in% modules, , drop = FALSE]",
+      "  }",
+      "  summary_df <- data.frame(",
+      "    metric = c('program_name', 'modules', 'genes_in_program', 'rationale'),",
+      "    value = c(",
+      "      program_name,",
+      "      paste(modules, collapse = ' + '),",
+      "      nrow(gene_table),",
+      "      row$rationale[1L] %||% ''",
+      "    ),",
+      "    stringsAsFactors = FALSE",
+      "  )",
+      "  list(",
+      "    summary = summary_df,",
+      "    modules = modules,",
+      "    gene_table = gene_table,",
+      "    rationale = row$rationale[1L] %||% ''",
+      "  )",
+      "}",
+      "",
+      "reconstruct_saved_program_from_bundle <- function(base_dir = '.', program_name) {",
+      "  program_tbl <- read_bundle_table(file.path(base_dir, 'tables', 'wgcna_programs.csv'))",
+      "  selected_summary <- read_bundle_table(file.path(base_dir, 'tables', 'wgcna_selected_program_summary.csv'))",
+      "  selected_gene_table <- read_bundle_table(file.path(base_dir, 'tables', 'wgcna_selected_program_gene_table.csv'))",
+      "  gene_modules <- read_bundle_table(file.path(base_dir, 'tables', 'wgcna_gene_modules.csv'))",
+      "  if (nrow(selected_summary) && nzchar(program_name) && identical(selected_summary$name[1], program_name)) {",
+      "    modules <- trimws(unlist(strsplit(selected_summary$modules[1], '\\\\+', perl = TRUE)))",
+      "    modules <- modules[nzchar(modules)]",
+      "    return(list(summary = data.frame(metric = c('program_name', 'modules', 'genes_in_program', 'rationale'), value = c(program_name, paste(modules, collapse = ' + '), nrow(selected_gene_table), selected_summary$rationale[1] %||% ''), stringsAsFactors = FALSE), modules = modules, gene_table = selected_gene_table, rationale = selected_summary$rationale[1] %||% ''))",
+      "  }",
+      "  if (!nrow(program_tbl) || !nzchar(program_name) || !program_name %in% program_tbl$name) stop('Requested combined program is not present in the report bundle.')",
+      "  row <- program_tbl[program_tbl$name == program_name, , drop = FALSE]",
+      "  modules <- trimws(unlist(strsplit(row$modules[1], '\\\\+', perl = TRUE)))",
+      "  modules <- modules[nzchar(modules)]",
+      "  gene_table <- gene_modules[gene_modules$module %in% modules, , drop = FALSE]",
+      "  list(summary = data.frame(metric = c('program_name', 'modules', 'genes_in_program', 'rationale'), value = c(program_name, paste(modules, collapse = ' + '), nrow(gene_table), row$rationale[1] %||% ''), stringsAsFactors = FALSE), modules = modules, gene_table = gene_table, rationale = row$rationale[1] %||% '')",
+      "}",
+      "",
+      "prioritize_semgraph_rows <- function(unit_rows, de_df = NULL, max_genes = 500L, alpha = 0.05, lfc_cutoff = 0) {",
+      "  rows <- unit_rows",
+      "  if (nrow(rows) <= max_genes) return(rows)",
+      "  rows$priority_score <- rows$kWithin %||% 0",
+      "  rows$abs_log2fc <- 0",
+      "  rows$de_supported <- FALSE",
+      "  if (!is.null(de_df) && nrow(de_df) > 0L && 'gene_id' %in% names(rows)) {",
+      "    de_match <- de_df[match(rows$gene_id, de_df$gene_id), , drop = FALSE]",
+      "    rows$abs_log2fc <- ifelse(is.na(de_match$log2FoldChange), 0, abs(de_match$log2FoldChange))",
+      "    rows$de_supported <- deg_mask(de_match, alpha = alpha, lfc_cutoff = lfc_cutoff)",
+      "  }",
+      "  kw <- rows$kWithin",
+      "  kw[!is.finite(kw)] <- 0",
+      "  if (length(kw) && diff(range(kw, na.rm = TRUE)) > 0) {",
+      "    kw_scaled <- (kw - min(kw, na.rm = TRUE)) / diff(range(kw, na.rm = TRUE))",
+      "  } else {",
+      "    kw_scaled <- rep(0, length(kw))",
+      "  }",
+      "  rows$priority_score <- 5 * rows$de_supported + rows$abs_log2fc + 2 * kw_scaled",
+      "  rows <- rows[order(rows$priority_score, decreasing = TRUE), , drop = FALSE]",
+      "  rows <- rows[!duplicated(rows$hgnc_symbol) & nzchar(rows$hgnc_symbol), , drop = FALSE]",
+      "  head(rows, max_genes)",
+      "}",
+      "",
+      "pick_binary_group <- function(metadata, col_name) {",
+      "  if (is.null(col_name) || !nzchar(col_name) || !col_name %in% names(metadata)) return(NULL)",
+      "  vals <- metadata[[col_name]]",
+      "  if (is.factor(vals) || is.character(vals)) {",
+      "    vals <- factor(vals)",
+      "    if (nlevels(vals) != 2L) return(NULL)",
+      "    return(as.integer(vals == levels(vals)[2L]))",
+      "  }",
+      "  uniq <- sort(unique(stats::na.omit(vals)))",
+      "  if (length(uniq) == 2L) return(as.integer(vals == uniq[2L]))",
+      "  NULL",
+      "}",
+      "",
+      "resolve_semgraph_unit_from_bundle <- function(base_dir = '.', analysis_unit, wgcna_rebuilt, gene_map, de_df = NULL, alpha = 0.05, lfc_cutoff = 0) {",
+      "  if (!nzchar(analysis_unit)) stop('SEMgraph analysis unit is missing.')",
+      "  unit_lower <- tolower(analysis_unit)",
+      "  is_program <- startsWith(unit_lower, 'program:')",
+      "  unit_name <- trimws(sub('^[^:]+:', '', analysis_unit))",
+      "  if (!nzchar(unit_name)) unit_name <- analysis_unit",
+      "  if (is_program) {",
+      "    prog <- reconstruct_saved_program_from_bundle(base_dir, unit_name)",
+      "    rows <- prog$gene_table %||% data.frame()",
+      "    if (nrow(rows) && !('hgnc_symbol' %in% names(rows))) rows <- attach_gene_labels(rows, gene_map)",
+      "    rows <- rows[!duplicated(rows$hgnc_symbol) & nzchar(rows$hgnc_symbol), , drop = FALSE]",
+      "    return(list(rows = rows, label = unit_name, type = 'program', source_modules = paste(prog$modules %||% character(), collapse = ' + '), rationale = prog$rationale %||% ''))",
+      "  }",
+      "  module_name <- unit_name",
+      "  gm <- read_bundle_table(file.path(base_dir, 'tables', 'wgcna_gene_modules.csv'))",
+      "  gene_ids <- names(wgcna_rebuilt$module_colors)[wgcna_rebuilt$module_colors == module_name]",
+      "  rows <- gm[gm$module == module_name, , drop = FALSE]",
+      "  if (!nrow(rows)) {",
+      "    rows <- data.frame(gene_id = gene_ids, stringsAsFactors = FALSE)",
+      "    rows <- attach_gene_labels(rows, gene_map)",
+      "  }",
+      "  rows <- rows[!duplicated(rows$hgnc_symbol) & nzchar(rows$hgnc_symbol), , drop = FALSE]",
+      "  list(rows = rows, label = module_name, type = 'module', source_modules = module_name, rationale = 'Single WGCNA module used directly as the SEMgraph prior gene set.')",
+      "}",
+      "",
+      "get_last_log_params <- function(snap, step_name) {",
+      "  logs <- snap$analysis_log %||% data.frame()",
+      "  if (is.null(logs) || !nrow(logs) || !('step' %in% names(logs)) || !('params_json' %in% names(logs))) return(list())",
+      "  idx <- which(logs$step == step_name)",
+      "  if (!length(idx)) return(list())",
+      "  raw <- logs$params_json[max(idx)]",
+      "  if (is.null(raw) || is.na(raw) || !nzchar(raw)) return(list())",
+      "  jsonlite::fromJSON(raw, simplifyVector = FALSE)",
+      "}",
+      "",
+      "rebuild_wgcna_from_snapshot <- function(snap, cur) {",
+      "  params <- get_last_log_params(snap, 'run_wgcna')",
+      "  rebuild_wgcna_from_params(params, cur)",
+      "}",
+      "",
+      "rebuild_wgcna_from_params <- function(params, cur) {",
+      "  top_variable_genes <- params$top_variable_genes %||% 4000",
+      "  power_mode <- params$power_mode %||% 'auto'",
+      "  manual_power <- params$manual_power %||% 6",
+      "  min_module_size <- params$min_module_size %||% 30",
+      "  deep_split <- params$deep_split %||% 2",
+      "  merge_cut_height <- params$merge_cut_height %||% 0.2",
+      "  dat_expr <- t(cur$log_cpm)",
+      "  gene_var <- apply(dat_expr, 2, stats::var, na.rm = TRUE)",
+      "  keep_genes <- names(sort(gene_var, decreasing = TRUE))[seq_len(min(top_variable_genes, length(gene_var)))]",
+      "  dat_expr <- dat_expr[, keep_genes, drop = FALSE]",
+      "  soft <- WGCNA::pickSoftThreshold(dat_expr, powerVector = c(1:10, 12, 14, 16, 18, 20), verbose = 0)",
+      "  soft_power <- if (identical(power_mode, 'manual')) manual_power else (soft$powerEstimate %||% manual_power)",
+      "  adjacency <- WGCNA::adjacency(dat_expr, power = soft_power, type = 'signed', corFnc = 'cor', corOptions = list(use = 'p'))",
+      "  tom <- WGCNA::TOMsimilarity(adjacency, TOMType = 'signed')",
+      "  diss_tom <- 1 - tom",
+      "  gene_tree <- stats::hclust(stats::as.dist(diss_tom), method = 'average')",
+      "  dynamic_modules <- dynamicTreeCut::cutreeDynamic(dendro = gene_tree, distM = diss_tom, deepSplit = deep_split, pamRespectsDendro = FALSE, minClusterSize = min_module_size)",
+      "  dynamic_colors <- WGCNA::labels2colors(dynamic_modules)",
+      "  names(dynamic_colors) <- colnames(dat_expr)",
+      "  merged <- WGCNA::mergeCloseModules(dat_expr, dynamic_colors, cutHeight = merge_cut_height, verbose = 0)",
+      "  module_colors <- merged$colors",
+      "  names(module_colors) <- colnames(dat_expr)",
+      "  list(",
+      "    dat_expr = dat_expr,",
+      "    soft = soft,",
+      "    soft_power = soft_power,",
+      "    gene_tree = gene_tree,",
+      "    module_colors = module_colors,",
+      "    dynamic_colors = dynamic_colors,",
+      "    params = params",
+      "  )",
+      "}",
+      "",
+      "read_bundle_semgraph_context <- function(base_dir = '.') {",
+      "  meta <- read_bundle_table(file.path(base_dir, 'tables', 'semgraph_metadata.csv'))",
+      "  state_tbl <- read_bundle_table(file.path(base_dir, 'tables', 'semgraph_report_state.csv'))",
+      "  state <- if (nrow(state_tbl)) stats::setNames(as.list(state_tbl$value), state_tbl$key) else list()",
+      "  list(",
+      "    analysis_unit = if (nrow(meta)) meta$analysis_unit[1] else '',",
+      "    focal_gene = if (nrow(meta)) meta$focal_gene[1] else '',",
+      "    graph = list(nodes = read_bundle_table(file.path(base_dir, 'tables', 'semgraph_graph_nodes.csv')), edges = read_bundle_table(file.path(base_dir, 'tables', 'semgraph_graph_edges.csv'))),",
+      "    base_graph = list(nodes = read_bundle_table(file.path(base_dir, 'tables', 'semgraph_base_graph_nodes.csv')), edges = read_bundle_table(file.path(base_dir, 'tables', 'semgraph_base_graph_edges.csv'))),",
+      "    degree_table = read_bundle_table(file.path(base_dir, 'tables', 'semgraph_degree_table.csv')),",
+      "    edge_validation_table = read_bundle_table(file.path(base_dir, 'tables', 'semgraph_edge_validation_table.csv')),",
+      "    pathway_summary = read_bundle_table(file.path(base_dir, 'tables', 'semgraph_pathway_summary.csv')),",
+      "    report_state = state",
+      "  )",
+      "}",
+      "",
+      "rebuild_semgraph_input_chain_from_bundle <- function(base_dir = '.', cur, de_res, wgcna_rebuilt, analysis_unit = NULL) {",
+      "  logs <- read_bundle_analysis_log(base_dir)",
+      "  de_params <- get_last_log_params_from_table(logs, 'run_deseq2')",
+      "  semgraph_params <- get_last_log_params_from_table(logs, 'run_semgraph')",
+      "  bundle_semgraph <- read_bundle_semgraph_context(base_dir)",
+      "  analysis_unit <- analysis_unit %||% (bundle_semgraph$analysis_unit %||% '')",
+      "  if (!nzchar(analysis_unit)) stop('SEMgraph analysis unit is not available in the report bundle.')",
+      "  unit_lower <- tolower(analysis_unit)",
+      "  is_program <- startsWith(unit_lower, 'program:')",
+      "  unit_name <- trimws(sub('^[^:]+:', '', analysis_unit))",
+      "  if (!nzchar(unit_name)) unit_name <- analysis_unit",
+      "  if (is_program) {",
+      "    selected_program <- reconstruct_saved_program_from_bundle(base_dir, unit_name)",
+      "    gene_table <- selected_program$gene_table %||% data.frame()",
+      "    source_modules <- paste(selected_program$modules %||% character(), collapse = ' + ')",
+      "    rationale <- selected_program$rationale %||% ''",
+      "    unit_type <- 'combined program'",
+      "  } else {",
+      "    module_name <- unit_name",
+      "    gene_modules <- read_bundle_table(file.path(base_dir, 'tables', 'wgcna_gene_modules.csv'))",
+      "    gene_ids <- names(wgcna_rebuilt$module_colors)[wgcna_rebuilt$module_colors == module_name]",
+      "    gene_table <- cur$gene_map[match(gene_ids, cur$gene_map$gene_id), , drop = FALSE]",
+      "    gm <- gene_modules[gene_modules$module == module_name, , drop = FALSE]",
+      "    if (nrow(gm)) gene_table <- gm",
+      "    source_modules <- module_name",
+      "    rationale <- 'Single WGCNA module used directly as the SEMgraph prior gene set.'",
+      "    unit_type <- 'single module'",
+      "  }",
+      "  if (!nrow(gene_table)) gene_table <- data.frame(gene_id = character(), stringsAsFactors = FALSE)",
+      "  if (!('gene_id' %in% names(gene_table))) gene_table$gene_id <- character(nrow(gene_table))",
+      "  de_genes <- unique(de_res$df$gene_id[deg_mask(de_res$df)])",
+      "  genes_in_unit <- unique(gene_table$gene_id[!is.na(gene_table$gene_id) & nzchar(gene_table$gene_id)])",
+      "  de_overlap <- intersect(genes_in_unit, de_genes)",
+      "  argument_trace <- data.frame(stage = c('Input loading', 'DESeq2', 'WGCNA', if (is_program) 'Combined program' else 'Single module selection', 'SEMgraph'), arguments = c(sprintf('counts_path=%s; metadata_path=%s; min_count=%s; min_samples=%s', cur$counts_path %||% '', cur$metadata_path %||% '', cur$min_count %||% '', cur$min_samples %||% ''), sprintf('selected_samples=%s; formula=%s; contrast=%s:%s vs %s', paste(de_params$selected_samples %||% character(), collapse = ', '), de_params$active_design %||% '', de_params$comparison_variable %||% '', de_params$numerator %||% '', de_params$denominator %||% ''), sprintf('top_variable_genes=%s; power_mode=%s; manual_power=%s; min_module_size=%s; deep_split=%s; merge_cut_height=%s', wgcna_rebuilt$params$top_variable_genes %||% '', wgcna_rebuilt$params$power_mode %||% '', wgcna_rebuilt$params$manual_power %||% '', wgcna_rebuilt$params$min_module_size %||% '', wgcna_rebuilt$params$deep_split %||% '', wgcna_rebuilt$params$merge_cut_height %||% ''), if (is_program) sprintf('program_name=%s; source_modules=%s', unit_name, source_modules) else sprintf('selected_module=%s', source_modules), sprintf('analysis_unit=%s; display_mode=%s; max_model_genes=%s; max_annotation_genes=%s; group=%s; use_live_string=%s', analysis_unit, semgraph_params$display_mode %||% '', semgraph_params$max_model_genes %||% '', semgraph_params$max_annotation_genes %||% '', semgraph_params$group %||% '', semgraph_params$use_live_string %||% '')), stringsAsFactors = FALSE)",
+      "  continuity <- data.frame(step = c('1. Input data loaded','2. Gene filtering and QC transformation','3. Differential expression model fit','4. WGCNA network reconstruction', if (is_program) '5. Combined program reconstructed' else '5. Single module selected','6. SEMgraph prior gene set defined','7. Exported SEMgraph tables loaded'), inputs = c('Counts matrix and metadata','Filtered counts and metadata','Filtered counts, metadata, selected samples, design formula, and contrast','Log-CPM matrix and WGCNA tuning parameters', if (is_program) 'Saved WGCNA program table and selected-program gene table from the bundle' else 'Rebuilt module colors and exported WGCNA gene-module table','Gene table derived from the chosen module or combined program','Exported SEMgraph CSV tables from the report bundle'), key_arguments = c('counts_path, metadata_path, min_count, min_samples','min_count, min_samples','selected_samples, formula_str, contrast_var, contrast_num, contrast_den','top_variable_genes, power_mode/manual_power, min_module_size, deep_split, merge_cut_height', if (is_program) 'program_name and saved source modules' else 'selected module name from analysis_unit','analysis_unit, display_mode, max_model_genes, max_annotation_genes','bundle SEMgraph graph/state tables'), outputs = c(sprintf('%s samples and %s genes read', ncol(cur$counts), nrow(cur$counts)), sprintf('%s genes after filtering', nrow(cur$filtered)), sprintf('%s DE result rows', nrow(de_res$df)), sprintf('%s genes entered the rebuilt WGCNA expression matrix', ncol(wgcna_rebuilt$dat_expr)), if (is_program) sprintf('%s genes from modules %s', nrow(gene_table), source_modules) else sprintf('%s genes assigned to module %s', length(genes_in_unit), source_modules), sprintf('%s genes in the SEMgraph input unit, %s of them current DEGs', length(genes_in_unit), length(de_overlap)), sprintf('Exported SEMgraph unit: %s', analysis_unit)), role_in_semgraph = c('Provides the raw transcriptomics and sample annotations.','Defines which genes are eligible for downstream modeling.','Provides the DEG layer later used for DEG-focused SEMgraph display and interpretation.','Defines the module structure from which the SEMgraph prior unit is drawn.', if (is_program) 'Unifies more than one module into a higher-level biological program before SEMgraph.' else 'Selects the single WGCNA module used as the SEMgraph prior.','Defines the exact gene universe that the SEMgraph analysis unit represents.','Provides the exact exported SEMgraph graph, state, and validation tables that the report re-displays.'), stringsAsFactors = FALSE)",
+      "  summary <- data.frame(metric = c('analysis_unit', 'unit_type', 'source_modules', 'genes_in_unit', 'current_deg_overlap', 'rationale'), value = c(analysis_unit, unit_type, source_modules, length(genes_in_unit), length(de_overlap), rationale), stringsAsFactors = FALSE)",
+      "  list(continuity = continuity, argument_trace = argument_trace, algorithm_logic = explain_semgraph_algorithm(), summary = summary, gene_table = gene_table, genes_in_unit = genes_in_unit, de_overlap = de_overlap, unit_type = unit_type, source_modules = source_modules)",
+      "}",
+      "",
+      "rebuild_semgraph_input_chain <- function(snap, cur, de_res, wgcna_rebuilt, analysis_unit = NULL) {",
+      "  analysis_unit <- analysis_unit %||% tryCatch(snap$semgraph$analysis_unit, error = function(...) '') %||% ''",
+      "  if (!nzchar(analysis_unit)) stop('SEMgraph analysis unit is not available in the report snapshot.')",
+      "  de_params <- get_last_log_params(snap, 'run_deseq2')",
+      "  semgraph_params <- get_last_log_params(snap, 'run_semgraph')",
+      "  unit_lower <- tolower(analysis_unit)",
+      "  is_program <- startsWith(unit_lower, 'program:')",
+      "  unit_name <- trimws(sub('^[^:]+:', '', analysis_unit))",
+      "  if (!nzchar(unit_name)) unit_name <- analysis_unit",
+      "  if (is_program) {",
+      "    selected_program <- reconstruct_saved_program(snap, unit_name)",
+      "    gene_table <- selected_program$gene_table %||% data.frame()",
+      "    source_modules <- paste(selected_program$modules %||% character(), collapse = ' + ')",
+      "    rationale <- selected_program$rationale %||% ''",
+      "    unit_type <- 'combined program'",
+      "  } else {",
+      "    module_name <- unit_name %||% (snap$wgcna$selected_module %||% '')",
+      "    gene_ids <- names(wgcna_rebuilt$module_colors)[wgcna_rebuilt$module_colors == module_name]",
+      "    gene_table <- cur$gene_map[match(gene_ids, cur$gene_map$gene_id), , drop = FALSE]",
+      "    if ('gene_modules' %in% names(snap$wgcna) && nrow(snap$wgcna$gene_modules %||% data.frame())) {",
+      "      gm <- snap$wgcna$gene_modules",
+      "      gm <- gm[gm$module == module_name, , drop = FALSE]",
+      "      if (nrow(gm)) gene_table <- gm",
+      "    }",
+      "    source_modules <- module_name",
+      "    rationale <- 'Single WGCNA module used directly as the SEMgraph prior gene set.'",
+      "    unit_type <- 'single module'",
+      "  }",
+      "  if (!nrow(gene_table)) gene_table <- data.frame(gene_id = character(), stringsAsFactors = FALSE)",
+      "  if (!('gene_id' %in% names(gene_table))) gene_table$gene_id <- character(nrow(gene_table))",
+      "  de_genes <- unique(de_res$df$gene_id[deg_mask(de_res$df)])",
+      "  genes_in_unit <- unique(gene_table$gene_id[!is.na(gene_table$gene_id) & nzchar(gene_table$gene_id)])",
+      "  de_overlap <- intersect(genes_in_unit, de_genes)",
+      "  argument_trace <- data.frame(",
+      "    stage = c(",
+      "      'Input loading',",
+      "      'DESeq2',",
+      "      'WGCNA',",
+      "      if (is_program) 'Combined program' else 'Single module selection',",
+      "      'SEMgraph'",
+      "    ),",
+      "    arguments = c(",
+      "      sprintf('counts_path=%s; metadata_path=%s; min_count=%s; min_samples=%s', snap$inputs$counts_path %||% '', snap$inputs$metadata_path %||% '', snap$inputs$min_count %||% '', snap$inputs$min_samples %||% ''),",
+      "      sprintf('selected_samples=%s; formula=%s; contrast=%s:%s vs %s', paste(de_params$selected_samples %||% character(), collapse = ', '), de_params$active_design %||% '', de_params$comparison_variable %||% '', de_params$numerator %||% '', de_params$denominator %||% ''),",
+      "      sprintf('top_variable_genes=%s; power_mode=%s; manual_power=%s; min_module_size=%s; deep_split=%s; merge_cut_height=%s', wgcna_rebuilt$params$top_variable_genes %||% '', wgcna_rebuilt$params$power_mode %||% '', wgcna_rebuilt$params$manual_power %||% '', wgcna_rebuilt$params$min_module_size %||% '', wgcna_rebuilt$params$deep_split %||% '', wgcna_rebuilt$params$merge_cut_height %||% ''),",
+      "      if (is_program) sprintf('program_name=%s; source_modules=%s', unit_name, source_modules) else sprintf('selected_module=%s', source_modules),",
+      "      sprintf('analysis_unit=%s; display_mode=%s; max_model_genes=%s; max_annotation_genes=%s; group=%s; use_live_string=%s', analysis_unit, semgraph_params$display_mode %||% '', semgraph_params$max_model_genes %||% '', semgraph_params$max_annotation_genes %||% '', semgraph_params$group %||% '', semgraph_params$use_live_string %||% '')",
+      "    ),",
+      "    stringsAsFactors = FALSE",
+      "  )",
+      "  continuity <- data.frame(",
+      "    step = c(",
+      "      '1. Input data loaded',",
+      "      '2. Gene filtering and QC transformation',",
+      "      '3. Differential expression model fit',",
+      "      '4. WGCNA network reconstruction',",
+      "      if (is_program) '5. Combined program reconstructed' else '5. Single module selected',",
+      "      '6. SEMgraph prior gene set defined',",
+      "      '7. Exported SEMgraph snapshot loaded'",
+      "    ),",
+      "    inputs = c(",
+      "      'Counts matrix and metadata',",
+      "      'Filtered counts and metadata',",
+      "      'Filtered counts, metadata, selected samples, design formula, and contrast',",
+      "      'Log-CPM matrix and WGCNA tuning parameters',",
+      "      if (is_program) 'Saved WGCNA program definition from the report snapshot' else 'Rebuilt module colors from WGCNA network reconstruction',",
+      "      'Gene table derived from the chosen module or combined program',",
+      "      'Saved report snapshot generated from the completed Shiny session'",
+      "    ),",
+      "    key_arguments = c(",
+      "      'counts_path, metadata_path, min_count, min_samples',",
+      "      'min_count, min_samples',",
+      "      'selected_samples, formula_str, contrast_var, contrast_num, contrast_den',",
+      "      'top_variable_genes, power_mode/manual_power, min_module_size, deep_split, merge_cut_height',",
+      "      if (is_program) 'program_name and saved source modules' else 'selected module name from analysis_unit',",
+      "      'analysis_unit, display_mode, max_model_genes, max_annotation_genes',",
+      "      'report_snapshot.rds'",
+      "    ),",
+      "    outputs = c(",
+      "      sprintf('%s samples and %s genes read', ncol(cur$counts), nrow(cur$counts)),",
+      "      sprintf('%s genes after filtering', nrow(cur$filtered)),",
+      "      sprintf('%s DE result rows', nrow(de_res$df)),",
+      "      sprintf('%s genes entered the rebuilt WGCNA expression matrix', ncol(wgcna_rebuilt$dat_expr)),",
+      "      if (is_program) sprintf('%s genes from modules %s', nrow(gene_table), source_modules) else sprintf('%s genes assigned to module %s', length(genes_in_unit), source_modules),",
+      "      sprintf('%s genes in the SEMgraph input unit, %s of them current DEGs', length(genes_in_unit), length(de_overlap)),",
+      "      sprintf('Exported SEMgraph unit: %s', analysis_unit)",
+      "    ),",
+      "    role_in_semgraph = c(",
+      "      'Provides the raw transcriptomics and sample annotations.',",
+      "      'Defines which genes are eligible for downstream modeling.',",
+      "      'Provides the DEG layer later used for DEG-focused SEMgraph display and interpretation.',",
+      "      'Defines the module structure from which the SEMgraph prior unit is drawn.',",
+      "      if (is_program) 'Unifies more than one module into a higher-level biological program before SEMgraph.' else 'Selects the single WGCNA module used as the SEMgraph prior.',",
+      "      'Defines the exact gene universe that the SEMgraph analysis unit represents.',",
+      "      'Preserves the exact visible SEMgraph outputs that were exported by the app.'",
+      "    ),",
+      "    stringsAsFactors = FALSE",
+      "  )",
+      "  summary <- data.frame(",
+      "    metric = c('analysis_unit', 'unit_type', 'source_modules', 'genes_in_unit', 'current_deg_overlap', 'rationale'),",
+      "    value = c(",
+      "      analysis_unit,",
+      "      unit_type,",
+      "      source_modules,",
+      "      length(genes_in_unit),",
+      "      length(de_overlap),",
+      "      rationale",
+      "    ),",
+      "    stringsAsFactors = FALSE",
+      "  )",
+      "  list(",
+      "    continuity = continuity,",
+      "    argument_trace = argument_trace,",
+      "    algorithm_logic = explain_semgraph_algorithm(),",
+      "    summary = summary,",
+      "    gene_table = gene_table,",
+      "    genes_in_unit = genes_in_unit,",
+      "    de_overlap = de_overlap,",
+      "    unit_type = unit_type,",
+      "    source_modules = source_modules",
+      "  )",
+      "}",
+      "",
+      "validate_semgraph_snapshot <- function(snap, analysis_unit = NULL) {",
+      "  stopifnot(!is.null(snap$semgraph))",
+      "  sg <- snap$semgraph",
+      "  degree_table <- sg$degree_table %||% data.frame()",
+      "  edge_validation <- sg$edge_validation_table %||% data.frame()",
+      "  pathway_summary <- sg$pathway_summary %||% data.frame()",
+      "  graph_nodes <- sg$graph$nodes %||% data.frame()",
+      "  graph_edges <- sg$graph$edges %||% data.frame()",
+      "  summary_df <- data.frame(",
+      "    metric = c(",
+      "      'analysis_unit',",
+      "      'focal_gene',",
+      "      'visible_graph_nodes',",
+      "      'visible_graph_edges',",
+      "      'degree_table_rows',",
+      "      'edge_validation_rows',",
+      "      'pathway_summary_rows',",
+      "      'string_supported_edges_in_visible_graph'",
+      "    ),",
+      "    value = c(",
+      "      sg$analysis_unit %||% '',",
+      "      sg$focal_gene %||% '',",
+      "      nrow(graph_nodes),",
+      "      nrow(graph_edges),",
+      "      nrow(degree_table),",
+      "      nrow(edge_validation),",
+      "      nrow(pathway_summary),",
+      "      if ('string_supported' %in% names(graph_edges)) sum(graph_edges$string_supported, na.rm = TRUE) else 0",
+      "    ),",
+      "    stringsAsFactors = FALSE",
+      "  )",
+      "  checks <- data.frame(",
+      "    check = c(",
+      "      'SEMgraph snapshot exists',",
+      "      'Visible graph contains nodes',",
+      "      'Visible graph edges reference visible nodes only',",
+      "      'Degree table is available',",
+      "      'Edge-validation table is available',",
+      "      'Requested analysis unit matches exported unit'",
+      "    ),",
+      "    passed = c(",
+      "      !is.null(sg),",
+      "      nrow(graph_nodes) > 0,",
+      "      if (!nrow(graph_edges)) TRUE else all(unique(c(graph_edges$source, graph_edges$target)) %in% graph_nodes$gene),",
+      "      nrow(degree_table) > 0,",
+      "      nrow(edge_validation) >= 0,",
+      "      if (is.null(analysis_unit) || !nzchar(analysis_unit)) TRUE else identical(sg$analysis_unit %||% '', analysis_unit)",
+      "    ),",
+      "    detail = c(",
+      "      'SEMgraph results were exported into the report snapshot.',",
+      "      'A non-empty visible SEMgraph view was captured for the report.',",
+      "      'All visible edges map to visible graph nodes in the exported SEMgraph view.',",
+      "      'The regulator-ranking table was exported.',",
+      "      'The edge-validation table was exported, even if zero rows pass a stricter filter.',",
+      "      'The exported SEMgraph section corresponds to the chosen module or combined program.'",
+      "    ),",
+      "    stringsAsFactors = FALSE",
+      "  )",
+      "  list(",
+      "    summary = summary_df,",
+      "    checks = checks,",
+      "    graph = list(nodes = graph_nodes, edges = graph_edges),",
+      "    degree_table = degree_table,",
+      "    edge_validation = edge_validation,",
+      "    pathway_summary = pathway_summary",
+      "  )",
+      "}",
+      "",
+      "rebuild_semgraph_report_views <- function(snap) {",
+      "  stopifnot(!is.null(snap$semgraph))",
+      "  sg <- snap$semgraph",
+      "  state <- sg$report_state %||% list()",
+      "  base_graph <- sg$base_graph %||% list(nodes = data.frame(), edges = data.frame())",
+      "  final_graph <- sg$graph %||% list(nodes = data.frame(), edges = data.frame())",
+      "  filter_state <- state$filter_state %||% NULL",
+      "  filter_active <- !is.null(filter_state)",
+      "  filter_rule <- if (filter_active) (filter_state$edge_rule %||% 'all') else 'all'",
+      "  string_cutoff <- state$string_cutoff %||% 0.7",
+      "  base_edges <- base_graph$edges %||% data.frame()",
+      "  filtered_edges <- if (nrow(base_edges)) {",
+      "    filter_validated_edges(base_edges, mode = filter_rule, string_cutoff = string_cutoff)",
+      "  } else {",
+      "    data.frame()",
+      "  }",
+      "  list(",
+      "    state = state,",
+      "    filter_active = filter_active,",
+      "    filter_rule = filter_rule,",
+      "    string_cutoff = string_cutoff,",
+      "    initial_graph = base_graph,",
+      "    filtered_graph = final_graph,",
+      "    filtered_edges_from_base = filtered_edges",
+      "  )",
       "}"
     )
     write_text_file(file.path(out_dir, "report_methods.R"), report_methods_lines)
     report_methods_block <- commented_code_block(report_methods_lines)
     write_text_file(file.path(out_dir, "analysis_commands.R"), c(
-      "# RNA-seq Workbench commands generated from the Shiny session",
+      "# RNA Hypothesis Workbench commands generated from the Shiny session",
+      "",
+      "# Environment / package checks",
+      commented_code_block(setup_code_lines),
       "",
       "# QC / input loading",
       commented_code_block(qc_code_lines),
@@ -6427,6 +7397,9 @@ server <- function(input, output, session) {
       "",
       "# WGCNA",
       commented_code_block(wgcna_code_lines),
+      "",
+      "# Combined WGCNA program (if used for downstream interpretation or SEMgraph)",
+      commented_code_block(program_code_lines),
       "",
       "# SEMgraph",
       commented_code_block(semgraph_code_lines)
@@ -6609,9 +7582,9 @@ server <- function(input, output, session) {
       "knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)",
       "library(jsonlite)",
       "library(plotly)",
-      "snap <- readRDS('report_snapshot.rds')",
       "source('report_methods.R')",
-      "logs <- snap$analysis_log",
+      "base_dir <- '.'",
+      "logs <- read_bundle_analysis_log(base_dir)",
       "parse_params <- function(x) {",
       "  if (is.null(x) || is.na(x) || !nzchar(x)) return(list())",
       "  jsonlite::fromJSON(x, simplifyVector = FALSE)",
@@ -6632,6 +7605,7 @@ server <- function(input, output, session) {
       "  if (!length(x)) return('No recorded parameters for this step.')",
       "  capture.output(str(x))",
       "}",
+      "snap <- tryCatch(readRDS('report_snapshot.rds'), error = function(...) NULL)",
       "```",
       "",
       "# How to use this report",
@@ -6646,14 +7620,70 @@ server <- function(input, output, session) {
       "",
       "# Generated commands",
       "",
-      "The bundle also includes `analysis_commands.R`, which contains copy-ready commands for another R session, and `report_methods.R`, which provides the helper functions those commands use.",
+      "The bundle also includes `analysis_commands.R`, which contains copy-ready commands for another R session, `report_methods.R`, which provides the helper functions those commands use, and `input_files_manifest.csv`, which records whether the original counts and metadata files were bundled locally for reuse on another computer.",
       "",
       "How to reuse the code in this report:",
       "",
-      "1. Define the helper functions first or source `report_methods.R`.",
-      "2. Run the generated workflow commands in `analysis_commands.R` from top to bottom in a fresh R session.",
-      "3. Compare the recreated objects and plots with the exported tables and HTML widgets in this bundle.",
-      "4. If you want to adapt the workflow, change the argument values shown in the generated commands rather than editing the report snapshot directly.",
+      "1. Run the package-setup block first so missing dependencies are caught early.",
+      "2. Define the helper functions next or source `report_methods.R`.",
+      "3. Run the generated workflow commands in `analysis_commands.R` from top to bottom in a fresh R session.",
+      "4. Compare the recreated objects and plots with the exported tables and HTML widgets in this bundle.",
+      "5. If you want to adapt the workflow, change the argument values shown in the generated commands rather than editing the report snapshot directly.",
+      "",
+      "# Environment setup code used by the generated workflow",
+      "",
+      "Run this first in a fresh R session. It checks that the packages needed by the exported helper functions and workflow commands are available before you start rebuilding the analysis.",
+      "",
+      "```{r, results='asis'}",
+      "cat('```r\\n')",
+      "cat(paste(c(",
+      "  \"source('report_methods.R')\",",
+      "  \"required_packages <- c(\",",
+      "  \"  'AnnotationDbi', 'org.Hs.eg.db', 'DESeq2', 'SummarizedExperiment',\",",
+      "  \"  'clusterProfiler', 'WGCNA', 'dynamicTreeCut', 'plotly', 'jsonlite'\",",
+      "  \")\",",
+      "  \"check_required_packages(required_packages)\"",
+      "), collapse = '\\n'))",
+      "cat('\\n```\\n')",
+      "```",
+      "",
+      "# Input file manifest",
+      "",
+      "This manifest tells you whether the original counts and metadata files were copied into the report bundle under `inputs/`. If they were bundled, the generated code will use those local bundle paths; if not, it will fall back to the original saved source paths.",
+      "",
+      "```{r}",
+      "utils::read.csv('input_files_manifest.csv', stringsAsFactors = FALSE)",
+      "```",
+      "",
+      "# Report snapshot provenance",
+      "",
+      "The bundle exports the SEMgraph continuity and visible graph state primarily as explicit CSV tables inside `tables/`. `report_snapshot.rds` is kept only as an intermediary cache-like validation artifact from the completed Shiny session so the report can optionally confirm that those exported tables remain internally consistent.",
+      "",
+      "Use this section to understand where `snap <- readRDS('report_snapshot.rds')` fits in the workflow:",
+      "",
+      "1. The app runs the selected analyses interactively.",
+      "2. The report exporter collects the current app state into `current_report_snapshot()`.",
+      "3. The exporter writes explicit bundle files such as SEMgraph graph tables, edge-validation tables, program tables, and the analysis log.",
+      "4. That same completed state is also saved as `report_snapshot.rds` as an optional intermediary cache/validation artifact.",
+      "5. The later SEMgraph report code rebuilds the chain from the bundle files first, then optionally uses the RDS artifact only to validate the exported state.",
+      "",
+      "```{r, results='asis'}",
+      "cat('```r\\n')",
+      "cat(paste(c(",
+      "  \"source('report_methods.R')\",",
+      "  \"# In the Shiny app, the report snapshot was produced from the completed live app state.\",",
+      "  \"logs <- read_bundle_analysis_log('.')\",",
+      "  \"bundle_semgraph <- read_bundle_semgraph_context('.')\",",
+      "  \"snap <- readRDS('report_snapshot.rds')\",",
+      "  \"snapshot_overview <- explain_report_snapshot(snap)\",",
+      "  \"snapshot_overview\"",
+      "), collapse = '\\n'))",
+      "cat('\\n```\\n')",
+      "```",
+      "",
+      "```{r}",
+      "if (!is.null(snap)) explain_report_snapshot(snap) else data.frame(message = 'report_snapshot.rds not loaded; bundle-first logic remains available from the exported CSV files.', stringsAsFactors = FALSE)",
+      "```",
       "",
       "# Core helper functions used by the generated commands",
       "",
@@ -6899,6 +7929,46 @@ server <- function(input, output, session) {
         "snap$wgcna$module_sizes",
         "```"
       )
+      if (!is.null(snapshot$wgcna$selected_program) || (!is.null(snapshot$wgcna$programs) && nrow(snapshot$wgcna$programs) > 0L)) {
+        rmd_lines <- c(rmd_lines,
+          "",
+          "# Combined program from WGCNA modules",
+          "",
+          "## Method meaning",
+          "",
+          "A combined program is a higher-level interpretation layer built from more than one WGCNA module when those modules appear to represent opposite arms of the same biological process. This is especially important when SEMgraph is later run on a program instead of on a single module.",
+          "",
+          "## Chosen arguments",
+          "",
+          "```{r}",
+          "show_params(last_params('create_wgcna_program'))",
+          "```",
+          "",
+          "Argument interpretation:",
+          "",
+          "- `program_name`: the label saved for the combined program in the app.",
+          "- `suggested_modules`: the modules that were combined into one higher-level biological unit.",
+          "",
+          "How to use the elements below:",
+          "",
+          "- Use this section to verify exactly which WGCNA modules fed the combined program before trusting any downstream SEMgraph result based on that program.",
+          "- The summary shows the saved program definition; the gene table shows the actual genes carried forward from the component modules.",
+          "- The code block below reconstructs the saved program object from the report snapshot, so the SEMgraph section can refer to an explicit combined-program definition rather than only to a program name.",
+          "",
+          "## Stepwise recreation",
+          "",
+          "### Recreate the saved combined program",
+          "",
+          "```{r}",
+          "selected_program <- reconstruct_saved_program(snap, snap$wgcna$selected_program$name %||% (snap$wgcna$programs$name[1] %||% ''))",
+          "selected_program$summary",
+          "```",
+          "",
+          "```{r}",
+          "head(selected_program$gene_table)",
+          "```"
+        )
+      }
       if (!is.null(snapshot$wgcna$module_graph)) {
         rmd_lines <- c(rmd_lines,
           "",
@@ -6956,7 +8026,196 @@ server <- function(input, output, session) {
         "- In the SEMgraph plot, node fill shows DE direction and magnitude, node role styling reflects causal position, gold halos mark druggability context, and edge colors reflect STRING support strength while SEMgraph still provides arrow direction.",
         "- The code blocks below can be reused to rebuild the selected SEMgraph setup and reproduce the same directed hypothesis layer, provided the helper functions and upstream objects are defined first.",
         "",
+        "How to judge whether SEMgraph really ran properly here:",
+        "",
+        "- The first code block below now rebuilds the SEMgraph chain from explicit bundle files rather than jumping directly to an RDS snapshot.",
+        "- If SEMgraph was run on a combined program, make sure the combined-program section above matches the intended source modules before interpreting the SEMgraph outputs.",
+        "- The resulting summary and checks confirm whether a visible graph, regulator table, and edge-validation artifacts were actually exported into the report bundle.",
+        "- The later `report_snapshot.rds` step is now secondary and is used only to validate the exported bundle state against the original completed Shiny session.",
+        "- The SEMgraph code block below now shows the near-verbatim internal fit chain too: prioritized SEMgraph rows, correlation-derived prior graph, `SEMgraph::transformData()`, `SEMgraph::graph2dag()`, `SEMgraph::SEMdag()`, and local regulator extraction.",
+        "- This bundle recreates the saved SEMgraph outputs exactly. A full raw-data rerun of the complete Shiny SEMgraph pipeline still depends on the larger workbench codebase.",
+        "",
         "## Stepwise recreation",
+        "",
+        "### Rebuild the upstream SEMgraph input chain",
+        "",
+        "This first step makes the full SEMgraph continuity explicit from counts and metadata through DESeq2, WGCNA, and the selected module or combined program. It uses the explicit bundle files first, not the RDS snapshot.",
+        "",
+        "```{r}",
+        "base_dir <- '.'",
+        "bundle_logs <- read_bundle_analysis_log(base_dir)",
+        "wgcna_params <- get_last_log_params_from_table(bundle_logs, 'run_wgcna')",
+        "semgraph_params <- get_last_log_params_from_table(bundle_logs, 'run_semgraph')",
+        "wgcna_rebuilt <- rebuild_wgcna_from_params(wgcna_params, cur)",
+        "semgraph_input <- rebuild_semgraph_input_chain_from_bundle(base_dir, cur, de_res, wgcna_rebuilt, analysis_unit = semgraph_params$analysis_unit %||% '')",
+        "semgraph_input$continuity",
+        "```",
+        "",
+        "```{r}",
+        "semgraph_input$argument_trace",
+        "```",
+        "",
+        "```{r}",
+        "semgraph_input$algorithm_logic",
+        "```",
+        "",
+        "```{r}",
+        "semgraph_input$summary",
+        "```",
+        "",
+        "```{r}",
+        "head(semgraph_input$gene_table)",
+        "```",
+        "",
+        "### Exact internal app SEMgraph call chain",
+        "",
+        "This block is the exact SEMgraph server-side call chain exported from the app run itself. It shows the internal sequence the workbench used when it generated the SEMgraph fit for this dataset.",
+        "",
+        "```{r, results='asis'}",
+        "if (file.exists('semgraph_runtime_trace.R')) {",
+        "  cat('```r\\n')",
+        "  cat(paste(readLines('semgraph_runtime_trace.R', warn = FALSE), collapse = '\\n'))",
+        "  cat('\\n```\\n')",
+        "} else {",
+        "  cat('No exact SEMgraph runtime trace file was exported in this bundle.')",
+        "}",
+        "```",
+        "",
+        "### Cache provenance and full cache-regeneration code",
+        "",
+        "This section reports only what the app can verify from code and real files: whether usable cache files existed, whether the SEMgraph fit itself was loaded from cache in this run, and how to force regeneration of the SEMgraph fit and its main annotation caches from scratch.",
+        "",
+        "```{r}",
+        "if (file.exists('tables/semgraph_cache_status.csv')) utils::read.csv('tables/semgraph_cache_status.csv', stringsAsFactors = FALSE) else data.frame(message = 'No SEMgraph cache-status table exported in this bundle.', stringsAsFactors = FALSE)",
+        "```",
+        "",
+        "```{r, results='asis'}",
+        "if (file.exists('semgraph_cache_regeneration.R')) {",
+        "  cat('```r\\n')",
+        "  cat(paste(readLines('semgraph_cache_regeneration.R', warn = FALSE), collapse = '\\n'))",
+        "  cat('\\n```\\n')",
+        "} else {",
+        "  cat('No SEMgraph cache-regeneration code was exported in this bundle.')",
+        "}",
+        "```",
+        "",
+        "### Near-verbatim internal SEMgraph fit chain",
+        "",
+        "This block mirrors the core internal server-side SEMgraph path as closely as possible inside the report bundle, so the reader can inspect the exact sequence of expressions that generated the directed SEMgraph fit.",
+        "",
+        "```{r}",
+        "unit_obj <- resolve_semgraph_unit_from_bundle(base_dir, semgraph_params$analysis_unit %||% '', wgcna_rebuilt, cur$gene_map, de_df = de_res$df, alpha = alpha, lfc_cutoff = lfc_cutoff)",
+        "prioritized_rows <- prioritize_semgraph_rows(unit_obj$rows, de_df = de_res$df, max_genes = max_model_genes, alpha = alpha, lfc_cutoff = lfc_cutoff)",
+        "head(prioritized_rows)",
+        "```",
+        "",
+        "```{r}",
+        "expr <- wgcna_rebuilt$dat_expr[, prioritized_rows$gene_id, drop = FALSE]",
+        "colnames(expr) <- prioritized_rows$hgnc_symbol",
+        "corr <- stats::cor(expr, use = 'pairwise.complete.obs')",
+        "diag(corr) <- 0",
+        "corr_threshold <- stats::quantile(abs(corr[upper.tri(corr)]), probs = 0.75, na.rm = TRUE)",
+        "adj <- abs(corr) >= corr_threshold",
+        "diag(adj) <- 0",
+        "prior_graph <- igraph::graph_from_adjacency_matrix(adj, mode = 'undirected', diag = FALSE)",
+        "prior_graph <- igraph::delete_vertices(prior_graph, igraph::V(prior_graph)[igraph::degree(prior_graph) == 0])",
+        "igraph::vcount(prior_graph)",
+        "```",
+        "",
+        "```{r}",
+        "expr_for_semgraph <- expr[, igraph::V(prior_graph)$name, drop = FALSE]",
+        "semgraph_data <- SEMgraph::transformData(expr_for_semgraph)$data",
+        "metadata_aligned <- cur$meta[match(rownames(semgraph_data), cur$meta$run_id), , drop = FALSE]",
+        "group_vec <- pick_binary_group(metadata_aligned, semgraph_params$group %||% NULL)",
+        "directed_graph <- igraph::as_directed(prior_graph, mode = 'arbitrary')",
+        "prior_dag <- SEMgraph::graph2dag(graph = directed_graph, data = semgraph_data)",
+        "dag_fit <- SEMgraph::SEMdag(graph = prior_dag, data = semgraph_data, LO = 'TO', beta = 0.1)",
+        "dag_graph <- dag_fit$dag",
+        "igraph::vcount(dag_graph)",
+        "```",
+        "",
+        "```{r}",
+        "out_degree <- igraph::degree(dag_graph, mode = 'out')",
+        "in_degree <- igraph::degree(dag_graph, mode = 'in')",
+        "total_degree <- out_degree + in_degree",
+        "focal_gene <- names(sort(total_degree, decreasing = TRUE))[1L]",
+        "upstream_nodes <- SEMgraph::ancestors(dag_graph, focal_gene)",
+        "downstream_nodes <- SEMgraph::descendants(dag_graph, focal_gene)",
+        "data.frame(metric = c('analysis_unit', 'genes_entering_semgraph', 'corr_threshold', 'dag_nodes', 'dag_edges', 'focal_gene', 'binary_group_used'), value = c(semgraph_params$analysis_unit %||% '', ncol(semgraph_data), signif(corr_threshold, 4), igraph::vcount(dag_graph), igraph::ecount(dag_graph), focal_gene, if (is.null(group_vec)) 'no binary group used' else semgraph_params$group %||% 'binary group present'), stringsAsFactors = FALSE)",
+        "```",
+        "",
+        "### Recreate the exported SEMgraph tables and graph state from bundle files",
+        "",
+        "```{r}",
+        "bundle_semgraph <- read_bundle_semgraph_context(base_dir)",
+        "bundle_semgraph$report_state",
+        "```",
+        "",
+        "```{r}",
+        "head(bundle_semgraph$base_graph$nodes)",
+        "```",
+        "",
+        "```{r}",
+        "head(bundle_semgraph$base_graph$edges)",
+        "```",
+        "",
+        "```{r}",
+        "head(bundle_semgraph$graph$nodes)",
+        "```",
+        "",
+        "```{r}",
+        "head(bundle_semgraph$graph$edges)",
+        "```",
+        "",
+        "### Validate the exported SEMgraph run",
+        "",
+        "The next step uses `report_snapshot.rds` only as an optional intermediary validation artifact. It should confirm the same SEMgraph state that was already reconstructed from the explicit bundle files above.",
+        "",
+        "```{r}",
+        "if (!is.null(snap)) {",
+        "  semgraph_report <- validate_semgraph_snapshot(snap, analysis_unit = semgraph_params$analysis_unit %||% bundle_semgraph$analysis_unit %||% '')",
+        "  semgraph_report$summary",
+        "} else {",
+        "  data.frame(message = 'report_snapshot.rds not available; bundle-first SEMgraph reconstruction above remains reproducible.', stringsAsFactors = FALSE)",
+        "}",
+        "```",
+        "",
+        "```{r}",
+        "if (exists('semgraph_report')) semgraph_report$checks else data.frame()",
+        "```",
+        "",
+        "### Recreate the initial SEMgraph graph state before filtering",
+        "",
+        "```{r}",
+        "if (!is.null(snap)) {",
+        "  semgraph_views <- rebuild_semgraph_report_views(snap)",
+        "  semgraph_views$state",
+        "} else {",
+        "  bundle_semgraph$report_state",
+        "}",
+        "```",
+        "",
+        "```{r}",
+        "if (exists('semgraph_views')) head(semgraph_views$initial_graph$nodes) else head(bundle_semgraph$base_graph$nodes)",
+        "```",
+        "",
+        "```{r}",
+        "if (exists('semgraph_views')) head(semgraph_views$initial_graph$edges) else head(bundle_semgraph$base_graph$edges)",
+        "```",
+        "",
+        "### Apply the saved report-time filtering logic",
+        "",
+        "```{r}",
+        "head(semgraph_views$filtered_edges_from_base)",
+        "```",
+        "",
+        "```{r}",
+        "head(semgraph_views$filtered_graph$nodes)",
+        "```",
+        "",
+        "```{r}",
+        "head(semgraph_views$filtered_graph$edges)",
+        "```",
         "",
         "### Degree table",
         "",
@@ -7054,13 +8313,36 @@ server <- function(input, output, session) {
     write_text_file(file.path(out_dir, "recreate_from_snapshot.R"), helper_lines)
 
     html_lines <- c(
-      "<!doctype html><html><head><meta charset='utf-8'><title>RNA-seq Workbench HTML Report</title>",
+      "<!doctype html><html><head><meta charset='utf-8'><title>RNA Hypothesis Workbench HTML Report</title>",
       "<style>body{font-family:Arial,sans-serif;background:#f6f7fb;color:#1f2937;margin:0;padding:24px;} .card{background:#fff;border:1px solid #d7dbe8;border-radius:10px;padding:16px;margin-bottom:16px;} iframe{width:100%;height:700px;border:1px solid #d7dbe8;border-radius:8px;background:#fff;} table{border-collapse:collapse;width:100%;} th,td{border:1px solid #d7dbe8;padding:6px 8px;text-align:left;} h1,h2,h3{margin-top:0;} a{color:#0b7285;} .method-box{margin-top:14px;padding:14px;border:1px solid #dbe4f0;border-radius:8px;background:#f8fbff;} .method-box h4{margin-bottom:8px;} .code-dropdown{margin-top:12px;border:1px solid #d7dbe8;border-radius:8px;background:#fbfcfe;} .code-dropdown summary{cursor:pointer;padding:10px 12px;font-weight:700;color:#334155;} .code-dropdown[open] summary{border-bottom:1px solid #e2e8f0;} .code-note{margin:10px 12px 0 12px;color:#556178;} .code-toolbar{display:flex;justify-content:flex-end;padding:8px 12px 0 12px;} .copy-btn{background:#0b7285;color:#fff;border:none;border-radius:6px;padding:6px 10px;cursor:pointer;font-size:12px;} .copy-btn.copied{background:#2f9e44;} .code-block{margin:8px 12px 12px 12px;padding:12px;background:#0f172a;color:#e2e8f0;border-radius:8px;overflow:auto;} .code-block code{font-family:Consolas,Menlo,monospace;font-size:12px;white-space:pre;} .report-links a{display:inline-block;margin-right:12px;margin-top:6px;}</style>",
       "<script>function copyCodeBlock(id, btn){var el=document.getElementById(id);if(!el)return;var txt=el.innerText||el.textContent||'';navigator.clipboard.writeText(txt).then(function(){if(btn){btn.classList.add('copied');btn.textContent='Copied';setTimeout(function(){btn.classList.remove('copied');btn.textContent='Copy code';},1500);}});}</script>",
       "</head><body>",
-      "<h1>RNA-seq Workbench HTML Report</h1>",
+      "<h1>RNA Hypothesis Workbench HTML Report</h1>",
       sprintf("<p>Generated at %s.</p>", htmltools::htmlEscape(snapshot$generated_at)),
-      "<div class='card'><h2>Reproducibility files</h2><p>This bundle includes both the saved outputs and the code needed to rebuild them. Use <code>report_methods.R</code> first for helper definitions, then <code>analysis_commands.R</code> for the session-specific workflow commands.</p><div class='report-links'><a href='analysis_commands.R'>Open analysis_commands.R</a><a href='report_methods.R'>Open report_methods.R</a></div></div>",
+      "<div class='card'><h2>Reproducibility files</h2><p>This bundle includes the saved outputs, the helper code, the generated session-specific commands, and the bundled input files when those input paths were available during export. Use <code>report_methods.R</code> first for helper definitions, then <code>analysis_commands.R</code> for the session-specific workflow commands.</p><div class='report-links'><a href='analysis_commands.R'>Open analysis_commands.R</a><a href='report_methods.R'>Open report_methods.R</a><a href='input_files_manifest.csv'>Open input file manifest</a></div></div>",
+      if (file.exists(file.path(out_dir, "semgraph_runtime_trace.R"))) sprintf("<div class='card'><h2>Exact SEMgraph runtime trace</h2><p>This file is the exact internal SEMgraph server-side call chain exported from the app run itself. It complements the bundle-executable reconstruction code by showing the actual app-side sequence that generated the SEMgraph fit.</p><div class='report-links'><a href='semgraph_runtime_trace.R'>Open semgraph_runtime_trace.R</a><a href='tables/semgraph_runtime_trace.csv'>Open SEMgraph runtime trace CSV</a></div>%s</div>", paste(html_code_panel("code_semgraph_runtime_trace", "Show exact internal SEMgraph call chain", c(readLines(file.path(out_dir, "semgraph_runtime_trace.R"), warn = FALSE)), "Reuse guide: this block shows the exact internal app-side SEMgraph chain captured from the run. Use it to audit consistency with the exported SEMgraph outputs and the bundle-reconstruction code."), collapse = "\n")) else NULL,
+      if (file.exists(file.path(out_dir, "semgraph_cache_regeneration.R"))) sprintf("<div class='card'><h2>SEMgraph cache provenance</h2><p>This section reports only cache facts the app can verify directly from code and existing files. It distinguishes between a usable cache file being present and a cache definitely being used during the run, then gives copy-ready code to force regeneration from scratch.</p><div class='report-links'><a href='semgraph_cache_regeneration.R'>Open semgraph_cache_regeneration.R</a><a href='tables/semgraph_cache_status.csv'>Open SEMgraph cache status CSV</a></div>%s</div>", paste(html_code_panel("code_semgraph_cache_trace", "Show SEMgraph cache-regeneration code", c(readLines(file.path(out_dir, "semgraph_cache_regeneration.R"), warn = FALSE)), "Reuse guide: this block shows which SEMgraph cache layers had usable files and how to force regeneration with refresh = TRUE so the cached artifacts can be recreated explicitly."), collapse = "\n")) else NULL,
+      "<div class='card'><h2>Environment setup</h2><p>Before reusing any section-specific code, first confirm that the required packages are installed in the new R session. The commands below perform that check explicitly and stop early if the session is missing a required dependency.</p>",
+      html_code_panel("code_setup", "Show package and environment setup code", setup_code_lines, "Reuse guide: run this setup block first in a fresh R session. It checks that the packages needed by the exported helpers and workflow commands are installed before you proceed."),
+      "</div>",
+      "<div class='card'><h2>Report snapshot provenance</h2><p>The SEMgraph and combined-program sections later in this bundle now use explicit exported bundle files first, especially the analysis log and the SEMgraph/WGCNA tables under <code>tables/</code>. <code>report_snapshot.rds</code> is kept only as an intermediary cache-like validation artifact from the completed Shiny session so the report can optionally validate that the exported state is internally consistent.</p>",
+      html_method_card(
+        "How to interpret report_snapshot.rds",
+        c(
+            "The earlier code blocks in this report rebuild the raw-data workflow step by step from counts and metadata. The SEMgraph section now continues that chain by reading explicit bundle files such as the analysis log, WGCNA program tables, and exported SEMgraph graph tables.",
+            "report_snapshot.rds is still included, but it is now only an intermediary cache-like validation artifact rather than the primary source of continuity for SEMgraph."
+          ),
+          c(
+            "current_report_snapshot() is an app-internal collector that exists only inside the running Shiny session.",
+            "The exporter writes CSV tables for the visible SEMgraph state and also saves report_snapshot.rds as an optional cached copy of the same completed app state."
+          ),
+          c(
+            "Use the snapshot overview below to confirm which analyses were present in the exported bundle before reading the later SEMgraph code.",
+            "When you later see snap <- readRDS('report_snapshot.rds'), interpret it only as an additional validation step layered on top of the explicit bundle tables, not as the primary continuity path."
+          )
+        ),
+      html_code_panel("code_snapshot_provenance", "Show report snapshot provenance code", snapshot_provenance_code_lines, "Reuse guide: this block shows how the explicit bundle tables and the optional snapshot artifact relate to one another. Use it before the SEMgraph section if you want to inspect the exported app state directly."),
+      "<p><a href='report_snapshot.rds'>Open report snapshot RDS</a></p><p><a href='analysis_log.csv'>Open analysis log CSV</a></p><p><a href='input_files_manifest.csv'>Open input file manifest</a></p></div>",
       "<div class='card'><h2>Core helper functions</h2><p>The generated report code depends on helper functions such as <code>read_inputs()</code>, <code>deg_mask()</code>, and <code>run_de()</code>. They are shown here directly so the report remains self-contained and the copied code is understandable at first use.</p>",
       html_code_panel("code_report_methods", "Show required helper functions", report_methods_lines, "Reuse guide: copy or source these helpers first in a new R session. The later workflow code boxes assume these functions already exist."),
       "</div>",
@@ -7167,6 +8449,30 @@ server <- function(input, output, session) {
         "<p><a href='tables/wgcna_gene_modules.csv'>Open WGCNA gene module CSV</a></p></div>"
       )
     }
+    if (!is.null(snapshot$wgcna) && (!is.null(snapshot$wgcna$selected_program) || (!is.null(snapshot$wgcna$programs) && nrow(snapshot$wgcna$programs) > 0L))) {
+      html_lines <- c(html_lines,
+        "<div class='card'><h2>Combined WGCNA program</h2><p>This section documents the combined biological program used for downstream interpretation when more than one WGCNA module was intentionally carried forward together.</p>",
+        html_method_card(
+          "How to read this combined-program step",
+          c(
+            "A combined program is not a replacement for the original WGCNA modules. It is a higher-level interpretation layer used when separate modules appear to represent different arms of the same biology.",
+            "This step is especially important when SEMgraph is run on a program, because it shows exactly which WGCNA modules and genes were combined before the causal layer was built."
+          ),
+          c(
+            sprintf("Saved program name: %s.", tryCatch(snapshot$wgcna$selected_program$name, error = function(...) "NA")),
+            sprintf("Source modules: %s.", paste(tryCatch(snapshot$wgcna$selected_program$modules, error = function(...) character()), collapse = " + ")),
+            sprintf("Saved rationale: %s.", tryCatch(snapshot$wgcna$selected_program$rationale, error = function(...) "NA"))
+          ),
+          c(
+            "Use this section to verify that the combined program is biologically reasonable before trusting any SEMgraph result built from it.",
+            "The summary and gene table tell you which module arms and genes were carried forward.",
+            "The code dropdown reconstructs the combined program object from the saved report snapshot so the SEMgraph section has an explicit upstream program definition."
+          )
+        ),
+        html_code_panel("code_program", "Show copy-ready combined-program code", program_code_lines, "This block rebuilds the saved combined WGCNA program from the report snapshot and exposes its summary and gene table. Run it before the SEMgraph block when SEMgraph was based on a program."),
+        "<p><a href='tables/wgcna_gene_modules.csv'>Open WGCNA gene module CSV</a></p><p><a href='tables/wgcna_selected_program_gene_table.csv'>Open selected combined-program gene table CSV</a></p></div>"
+      )
+    }
     if (file.exists(file.path(plots_dir, "semgraph_subgraph.html"))) {
       html_lines <- c(html_lines,
         "<div class='card'><h2>SEMgraph subgraph</h2><p>This graph is the displayed SEMgraph view exported from the app after all current filtering rules were applied, including any STRING edge-validation filter.</p><iframe src='plots/semgraph_subgraph.html'></iframe>",
@@ -7179,15 +8485,21 @@ server <- function(input, output, session) {
           c(
             sprintf("Analysis unit: %s. This determines which WGCNA module or combined program was used as the SEMgraph prior set.", semgraph_params$analysis_unit %||% snapshot$semgraph$analysis_unit %||% "NA"),
             sprintf("Display mode: %s. This controls whether the graph view stays strictly DEG-focused or allows connector genes for readability.", semgraph_params$display_mode %||% "de_connectors"),
-            sprintf("Maximum genes entering SEMgraph fit: %s; maximum genes receiving external annotation: %s. These settings cap computational cost while prioritizing the most relevant genes.", semgraph_params$max_model_genes %||% 300, semgraph_params$max_annotation_genes %||% 180)
+            sprintf("Maximum genes entering SEMgraph fit: %s; maximum genes receiving external annotation: %s. These settings cap computational cost while prioritizing the most relevant genes.", semgraph_params$max_model_genes %||% 300, semgraph_params$max_annotation_genes %||% 180),
+            sprintf("Perturbation/group variable: %s. When present, this is the binary metadata column used for local causal-effect estimation and interpretation.", semgraph_params$group %||% "None recorded")
           ),
           c(
             "Use the graph for directional hypothesis inspection, then use the regulator and edge CSV tables for exact numeric support.",
             "Node styling carries multiple meanings at once: DE support, causal role, and druggability context. Edge colors summarize STRING support strength, while arrow direction still comes from SEMgraph.",
-            "The code dropdown captures the chosen SEMgraph setup and can be reused after the helper functions and upstream DE/WGCNA objects are already defined."
+            "The code dropdown now also runs a report-level validation of the exported SEMgraph artifacts so the reader can confirm that the saved graph, regulator table, and edge-validation outputs are internally consistent.",
+            "It first rebuilds the exact upstream SEMgraph input chain from counts and metadata through DESeq2, WGCNA, and the selected module or combined program, then reads the exported SEMgraph graph/state tables from the bundle, and only after that uses the optional RDS snapshot as a secondary validation step.",
+            "The same code path also exposes a stage-by-stage algorithm explanation table, so the reader can see how SEMgraph moves from a prior graph to a directed local hypothesis network.",
+            "The SEMgraph code panel now also includes the near-verbatim internal fit chain with explicit calls to SEMgraph functions such as transformData, graph2dag, and SEMdag, so the core causal-fit logic is visible instead of being hidden behind a wrapper.",
+            "The bundle also exposes a separate exact SEMgraph runtime-trace file captured from the app run itself, so you can compare the true app-side call chain against the exported graph and tables.",
+            "If the analysis unit is a combined program, read the combined-program section immediately above first, because it documents the exact WGCNA modules unified before SEMgraph was run."
           )
         ),
-        html_code_panel("code_semgraph", "Show copy-ready SEMgraph code", semgraph_code_lines, "This block records the chosen SEMgraph unit and key fit arguments. The exported graph and validation tables capture the exact visible SEMgraph state rendered in the app. Copy it into another R session after the helper functions and upstream objects are available."),
+        html_code_panel("code_semgraph", "Show copy-ready SEMgraph code", semgraph_code_lines, "This block rebuilds the SEMgraph input chain from counts, metadata, DESeq2, WGCNA, and the selected module or combined program; then it validates the exported SEMgraph snapshot and exposes the initial graph state, the saved filtering logic, and the final visible SEMgraph objects. Copy it into another R session after the helper functions are defined."),
         "<p><a href='tables/semgraph_degree_table.csv'>Open SEMgraph degree table CSV</a></p><p><a href='tables/semgraph_edge_validation_table.csv'>Open SEMgraph edge validation CSV</a></p></div>"
       )
     }
